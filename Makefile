@@ -1,32 +1,31 @@
-APP_NAME = Window
+# Target and directory definitions
 BUILD_DIR = build
-OBJ_DIR = $(BUILD_DIR)/obj
-EXEC = $(BUILD_DIR)/$(APP_NAME)
+DYLIB = $(BUILD_DIR)/libwindowmodifier.dylib
+INJECTOR = $(BUILD_DIR)/injector
 
+# Compiler and Configuration
 CC = clang
-CFLAGS = -g -fobjc-arc
-FRAMEWORKS = -framework Cocoa
+CFLAGS_DYLIB = -g -Wall -dynamiclib -fPIC -fobjc-arc
+CFLAGS_EXE = -g -Wall
+FRAMEWORKS = -framework CoreGraphics -framework CoreFoundation \
+             -framework ApplicationServices -framework Carbon -framework Cocoa
 
-SOURCES = src/main.m src/AppDelegate.m
-OBJECTS = $(patsubst src/%.m,$(OBJ_DIR)/%.o,$(SOURCES))
+# source file
+DYLIB_SOURCES = src/window_modifier.m src/injection_entry.c
+INJECTOR_SOURCES = src/injector.c
 
-all: app
+all: $(BUILD_DIR) $(DYLIB) $(INJECTOR)
 
-$(BUILD_DIR) $(OBJ_DIR):
+$(BUILD_DIR):
 	mkdir -p $@
 
-$(OBJ_DIR)/%.o: src/%.m | $(OBJ_DIR)
-	$(CC) $(CFLAGS) -c $< -o $@
+$(DYLIB): $(DYLIB_SOURCES)
+	$(CC) $(CFLAGS_DYLIB) $(FRAMEWORKS) $(DYLIB_SOURCES) -o $@
 
-$(EXEC): $(OBJECTS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(FRAMEWORKS) $(OBJECTS) -o $@
-
-app: $(EXEC)
+$(INJECTOR): $(INJECTOR_SOURCES)
+	$(CC) $(CFLAGS_EXE) $(INJECTOR_SOURCES) -o $@
 
 clean:
 	rm -rf $(BUILD_DIR)
 
-run: app
-	$(EXEC)
-
-.PHONY: all app clean run
+.PHONY: all clean
