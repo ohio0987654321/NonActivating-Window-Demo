@@ -1,16 +1,16 @@
-// injection_entry.c
+// injection_entry.c - Entry point for the injected DYLIB
 #include <stdio.h>
 #include <pthread.h>
 
-// Declaration of window_modifier_main function
-void* window_modifier_main(void* arg);
+// Forward declaration
+extern void* window_modifier_main(void*);
 
-// Function called when DyLib is loaded
+// Entry point function for DYLIB injection
 __attribute__((constructor))
-static void dylib_entry(void) {
+void dylib_entry(void) {
     printf("Window modifier dylib injected successfully\n");
     
-    // Runs in a separate thread (does not block the main thread)
+    // Call window_modifier_main in a separate thread
     pthread_t thread;
     pthread_create(&thread, NULL, window_modifier_main, NULL);
     pthread_detach(thread);
