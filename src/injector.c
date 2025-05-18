@@ -105,23 +105,41 @@ static bool isValidAppPath(const char *path) {
 }
 
 /**
- * Finds the main executable in an .app bundle
+ * Finds the main executable in an .app bundle or validates a direct executable path
  */
 static bool findMainExecutable(const char *appPath, char *exePath, size_t maxLen) {
+    // First check if the provided path is directly executable
+    struct stat s;
+    if (stat(appPath, &s) == 0 && S_ISREG(s.st_mode) && isExecutable(appPath)) {
+        printf("Using direct executable path: %s\n", appPath);
+        strncpy(exePath, appPath, maxLen);
+        return true;
+    }
+    
     // For .app bundles, construct the path to the main executable
     if (strstr(appPath, ".app") != NULL) {
-        // First try the modern structure: AppName.app/Contents/MacOS/AppName
-        snprintf(exePath, maxLen, "%s/Contents/MacOS", appPath);
+        // Check if path already includes Contents/MacOS/ and points to an executable
+        if (strstr(appPath, "/Contents/MacOS/") != NULL) {
+            // This might be a direct path to the executable inside the bundle
+            if (stat(appPath, &s) == 0 && S_ISREG(s.st_mode) && isExecutable(appPath)) {
+                printf("Using executable in app bundle: %s\n", appPath);
+                strncpy(exePath, appPath, maxLen);
+                return true;
+            }
+        }
+        
+        // Otherwise, try to find the executable in the bundle
+        char macOSPath[PATH_MAX];
+        snprintf(macOSPath, sizeof(macOSPath), "%s/Contents/MacOS", appPath);
         
         // Check if the MacOS directory exists
-        struct stat s;
-        if (stat(exePath, &s) != 0 || !S_ISDIR(s.st_mode)) {
+        if (stat(macOSPath, &s) != 0 || !S_ISDIR(s.st_mode)) {
             printf("Error: Invalid application bundle structure: MacOS directory not found\n");
             return false;
         }
         
         // Find the executable in the MacOS directory
-        DIR *dir = opendir(exePath);
+        DIR *dir = opendir(macOSPath);
         if (!dir) {
             printf("Error opening MacOS directory: %s\n", strerror(errno));
             return false;
@@ -138,13 +156,14 @@ static bool findMainExecutable(const char *appPath, char *exePath, size_t maxLen
             
             // Construct path to potential executable
             char potentialExe[PATH_MAX];
-            snprintf(potentialExe, sizeof(potentialExe), "%s/%s", exePath, entry->d_name);
+            snprintf(potentialExe, sizeof(potentialExe), "%s/%s", macOSPath, entry->d_name);
             
             // Check if it's executable
             if (isExecutable(potentialExe)) {
                 // Found an executable, use it
                 snprintf(exePath, maxLen, "%s", potentialExe);
                 found = true;
+                printf("Found executable in app bundle: %s\n", exePath);
                 break;
             }
         }
@@ -159,12 +178,8 @@ static bool findMainExecutable(const char *appPath, char *exePath, size_t maxLen
         return true;
     }
     
-    // For direct executables, just copy the path
-    if (isExecutable(appPath)) {
-        strncpy(exePath, appPath, maxLen);
-        return true;
-    }
-    
+    // Neither a direct executable nor a proper app bundle
+    printf("Error: Path is neither an executable nor a valid app bundle: %s\n", appPath);
     return false;
 }
 
