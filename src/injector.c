@@ -12,6 +12,11 @@
 #include <signal.h>
 #include <libproc.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <time.h>
+
+// Constants for registry paths
+#define REGISTRY_DIR "/tmp/window_modifier"
+#define REGISTRY_FILE "registry.dat"
 
 // Application patterns
 typedef struct {
@@ -27,7 +32,8 @@ static const char *chromeExes[] = {"Renderer", "GPU Process", "Plugin", "Utility
 static const char *safariExes[] = {"WebProcess", "GPUProcess", "NetworkProcess", "PluginProcess", NULL};
 static const char *firefoxExes[] = {"Web Content", "GPU Process", "RDD Process", "Socket Process", NULL};
 
-static const AppPattern knownApps[] = {
+// We'll keep these patterns available for future enhancements
+static const AppPattern knownApps[] __attribute__((unused)) = {
     {"Discord", "Discord", electronExes, true},
     {"Slack", "Slack", electronExes, true},
     {"Chrome", "Google Chrome", chromeExes, true},
@@ -55,6 +61,15 @@ static void signalHandler(int sig) {
     if (mainPid > 0) {
         kill(mainPid, SIGTERM);
         printf("Sent SIGTERM to process %d\n", mainPid);
+        
+        // Give a short time for the process to exit gracefully
+        usleep(500000); // 500ms
+        
+        // Force kill if still running
+        if (kill(mainPid, 0) == 0) {
+            printf("Process still running, sending SIGKILL\n");
+            kill(mainPid, SIGKILL);
+        }
     }
     
     exit(0);
@@ -170,6 +185,38 @@ static void killRunningInstances(const char *appName) {
 }
 
 /**
+ * Clean up registry directory and files
+ */
+static void cleanupRegistry(void) {
+    char registryPath[PATH_MAX];
+    snprintf(registryPath, sizeof(registryPath), "%s/%s", REGISTRY_DIR, REGISTRY_FILE);
+    
+    // Delete registry file if it exists
+    if (access(registryPath, F_OK) == 0) {
+        if (unlink(registryPath) == 0) {
+            printf("Removed existing registry file: %s\n", registryPath);
+        } else {
+            printf("Warning: Failed to remove registry file: %s (errno: %d)\n", 
+                   registryPath, errno);
+        }
+    }
+    
+    // Create registry directory if it doesn't exist
+    struct stat st;
+    if (stat(REGISTRY_DIR, &st) != 0) {
+        if (mkdir(REGISTRY_DIR, 0755) == 0) {
+            printf("Created registry directory: %s\n", REGISTRY_DIR);
+        } else {
+            printf("Warning: Failed to create registry directory: %s (errno: %d)\n", 
+                   REGISTRY_DIR, errno);
+        }
+    }
+    
+    // Ensure permissions are correct
+    chmod(REGISTRY_DIR, 0755);
+}
+
+/**
  * Enhanced DYLIB injection with environment setup
  */
 static int injectDylib(const char *executablePath, const char *dylibPath, bool waitForExit) {
@@ -266,21 +313,80 @@ static int injectDylib(const char *executablePath, const char *dylibPath, bool w
 }
 
 /**
+ * Wait for processes to initialize and show status
+ * 
+ * Note: This function is kept for future functionality but not currently used
+ */
+static void waitForProcessInitialization(pid_t mainPid) __attribute__((unused));
+static void waitForProcessInitialization(pid_t mainPid) {
+    printf("Waiting for processes to initialize...\n");
+    
+    // Wait for initial startup
+    usleep(1000000); // 1 second
+    
+    // Check if main process is still running
+    if (kill(mainPid, 0) != 0) {
+        printf("Warning: Main process %d terminated prematurely\n", mainPid);
+        return;
+    }
+    
+    // Count child processes - important for multi-process apps
+    int childCount = 0;
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "pgrep -P %d | wc -l", mainPid);
+    
+    FILE *fp = popen(cmd, "r");
+    if (fp) {
+        char buffer[32];
+        if (fgets(buffer, sizeof(buffer), fp)) {
+            childCount = atoi(buffer);
+        }
+        pclose(fp);
+    }
+    
+    if (childCount > 0) {
+        printf("Detected %d child processes - good sign for multi-process apps\n", childCount);
+    } else {
+        printf("No child processes detected yet - app may be single-process or still initializing\n");
+    }
+    
+    // Wait a little longer for full initialization
+    usleep(2000000); // 2 seconds
+    
+    // Check again
+    if (kill(mainPid, 0) != 0) {
+        printf("Warning: Main process %d terminated during initialization\n", mainPid);
+        return;
+    }
+    
+    printf("\nWindow modifier should now be active on all application windows.\n");
+    printf("You should see:\n");
+    printf("- Windows that stay on top of other applications\n");
+    printf("- Windows that don't steal focus when clicked\n");
+    printf("- Windows that are hidden in screenshots (test with ⌘+Shift+4)\n\n");
+}
+
+/**
  * Main entry point
  */
 int main(int argc, char *argv[]) {
     // Check command line arguments
-    if (argc != 2) {
-        printf("Usage: %s /path/to/application.(app|executable)\n", argv[0]);
+    if (argc < 2) {
+        printf("Usage: %s /path/to/application.(app|executable) [--debug]\n", argv[0]);
         printf("Examples:\n");
         printf("  %s /Applications/Discord.app\n", argv[0]);
         printf("  %s /Applications/Slack.app\n", argv[0]);
-        printf("  %s /Applications/Google\\ Chrome.app\n", argv[0]);
+        printf("  %s /Applications/Google\\ Chrome.app --debug\n", argv[0]);
         return 1;
     }
     
     // Get the application path from arguments
     const char *appPath = argv[1];
+    bool debugMode = (argc > 2 && strcmp(argv[2], "--debug") == 0);
+    
+    if (debugMode) {
+        printf("Debug mode enabled: extra logging will be displayed\n");
+    }
     
     // Verify the application exists
     if (!isValidAppPath(appPath)) {
@@ -299,7 +405,7 @@ int main(int argc, char *argv[]) {
     const char *appName = strrchr(executablePath, '/');
     appName = appName ? appName + 1 : executablePath;
     
-    // Get the DYLIB path (expected to be in the current directory)
+    // Get the DYLIB path (expected to be in the build directory)
     if (getcwd(dylibPath, sizeof(dylibPath)) == NULL) {
         perror("Failed to get current directory");
         return 1;
@@ -312,32 +418,8 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     
-        // Create or clean up the registry directory in the temp location
-    const char *tmp_dir = getenv("TMPDIR");
-    if (!tmp_dir) {
-        tmp_dir = "/tmp";
-    }
-    
-    char registry_dir[PATH_MAX];
-    snprintf(registry_dir, sizeof(registry_dir), "%s/window_modifier", tmp_dir);
-    
-    // Create registry directory if it doesn't exist
-    struct stat st;
-    if (stat(registry_dir, &st) != 0) {
-        mkdir(registry_dir, 0755);
-        printf("Created registry directory: %s\n", registry_dir);
-    } else {
-        // Clean registry to avoid using stale data
-        char registry_file[PATH_MAX];
-        snprintf(registry_file, sizeof(registry_file), "%s/registry.dat", registry_dir);
-        if (access(registry_file, F_OK) == 0) {
-            if (unlink(registry_file) == 0) {
-                printf("Removed stale registry file: %s\n", registry_file);
-            } else {
-                printf("Note: Failed to remove stale registry file: %s\n", registry_file);
-            }
-        }
-    }
+    // Clean up registry files for fresh start
+    cleanupRegistry();
     
     // Kill any existing instances of the app
     killRunningInstances(appName);
@@ -348,7 +430,12 @@ int main(int argc, char *argv[]) {
     signal(SIGSEGV, signalHandler); // Also catch segfaults
     
     printf("\nLaunching %s with window modifier...\n", appName);
-    printf("Press Ctrl+C to exit\n\n");
+    
+    // Set up debug environment if needed
+    if (debugMode) {
+        putenv("OBJC_DEBUG_MISSING_POOLS=YES");
+        putenv("OBJC_PRINT_EXCEPTIONS=YES");
+    }
     
     // Inject the DYLIB into the executable
     if (injectDylib(executablePath, dylibPath, true) != 0) {

@@ -4,6 +4,7 @@
 #include <string.h>
 #include <libproc.h>
 #include <unistd.h>
+#include <time.h>
 #include "window_registry.h"
 
 // Forward declaration
@@ -16,7 +17,9 @@ typedef enum {
     PROCESS_TYPE_RENDERER,
     PROCESS_TYPE_HELPER,
     PROCESS_TYPE_PLUGIN,
-    PROCESS_TYPE_GPU
+    PROCESS_TYPE_GPU,
+    PROCESS_TYPE_NETWORK,
+    PROCESS_TYPE_UTILITY
 } process_type_t;
 
 // Detect what type of process we're running in
@@ -36,6 +39,8 @@ static process_type_t detect_process_type(void) {
         strncpy(proc_name, proc_path, sizeof(proc_name) - 1);
     }
     
+    // Enhanced detection for Discord and Electron apps
+    
     // Common patterns for renderer processes in various frameworks
     if (strstr(proc_name, "Renderer") || 
         strstr(proc_name, "renderer") || 
@@ -44,8 +49,17 @@ static process_type_t detect_process_type(void) {
         return PROCESS_TYPE_RENDERER;
     }
     
+    // Network service processes
+    if (strstr(proc_name, "Network") || 
+        strstr(proc_name, "network") ||
+        strstr(proc_name, "Service") ||
+        strstr(proc_name, "service")) {
+        return PROCESS_TYPE_NETWORK;
+    }
+    
     // GPU process types
     if (strstr(proc_name, "GPU") || 
+        strstr(proc_name, "Gpu") ||
         strstr(proc_name, "gpu")) {
         return PROCESS_TYPE_GPU;
     }
@@ -56,16 +70,28 @@ static process_type_t detect_process_type(void) {
         return PROCESS_TYPE_PLUGIN;
     }
     
+    // Utility process types - expanded patterns
+    if (strstr(proc_name, "Utility") || 
+        strstr(proc_name, "utility") ||
+        strstr(proc_name, "crashpad") ||
+        strstr(proc_name, "Crashpad")) {
+        return PROCESS_TYPE_UTILITY;
+    }
+    
     // Helper process types
     if (strstr(proc_name, "Helper") || 
         strstr(proc_name, "helper") || 
-        strstr(proc_name, "Utility") || 
         strstr(proc_name, "Agent")) {
         return PROCESS_TYPE_HELPER;
     }
     
-    // Assume it's the main process if not any of the above
-    return PROCESS_TYPE_MAIN;
+    // Check if it's likely the main executable
+    if (strstr(proc_path, ".app/Contents/MacOS/")) {
+        return PROCESS_TYPE_MAIN;
+    }
+    
+    // Couldn't determine definitively
+    return PROCESS_TYPE_UNKNOWN;
 }
 
 // Get process type as string
@@ -76,6 +102,8 @@ static const char* process_type_name(process_type_t type) {
         case PROCESS_TYPE_HELPER: return "Helper";
         case PROCESS_TYPE_PLUGIN: return "Plugin";
         case PROCESS_TYPE_GPU: return "GPU";
+        case PROCESS_TYPE_NETWORK: return "Network";
+        case PROCESS_TYPE_UTILITY: return "Utility";
         default: return "Unknown";
     }
 }
@@ -96,21 +124,37 @@ void dylib_entry(void) {
     // Initialize registry (shared across all processes)
     window_registry_t *registry = registry_init();
     if (!registry) {
-        // Log the error but continue - we'll operate in standalone mode
         printf("[WINDOW-MOD] Warning: Failed to initialize window registry\n");
         printf("[WINDOW-MOD] Continuing in standalone mode (no cross-process coordination)\n");
     } else {
         printf("[WINDOW-MOD] Window registry initialized successfully\n");
     }
     
+    // Time-based protection for certain process types
+    if (proc_type == PROCESS_TYPE_NETWORK || 
+        proc_type == PROCESS_TYPE_GPU || 
+        proc_type == PROCESS_TYPE_UTILITY) {
+        // No need to modify windows for these service processes
+        printf("[WINDOW-MOD] Service process detected, window modification disabled\n");
+        return;
+    }
+    
     // Call window_modifier_main in a separate thread
     pthread_t thread;
-    if (pthread_create(&thread, NULL, window_modifier_main, NULL) != 0) {
-        printf("[WINDOW-MOD] Error: Failed to create window modifier thread\n");
-        printf("[WINDOW-MOD] Attempting to start modifier in main thread\n");
+    int create_result = pthread_create(&thread, NULL, window_modifier_main, NULL);
+    
+    if (create_result != 0) {
+        printf("[WINDOW-MOD] Error: Failed to create window modifier thread (error: %d)\n", 
+               create_result);
         
-        // If thread creation fails, try to run directly
-        window_modifier_main(NULL);
+        // For critical process types, don't try to run in main thread
+        // as it could interfere with the application's functionality
+        if (proc_type == PROCESS_TYPE_MAIN) {
+            printf("[WINDOW-MOD] Attempting to start modifier in main thread (fallback mode)\n");
+            window_modifier_main(NULL);
+        } else {
+            printf("[WINDOW-MOD] Skipping window modification for safety\n");
+        }
     } else {
         pthread_detach(thread);
         printf("[WINDOW-MOD] Window modifier thread started successfully\n");

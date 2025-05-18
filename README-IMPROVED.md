@@ -1,97 +1,107 @@
-# Enhanced Window Modifier for Multi-Process Applications
+# Window Modifier for macOS Applications
 
-This improved version of the window modifier provides better stability and compatibility with a wide range of multi-process applications.
+## Overview
+
+This proof-of-concept (PoC) project creates a window modifier library that can be injected into macOS applications. It enables windows to:
+
+1. Stay on top of other applications (always-on-top)
+2. Not steal focus when clicked on (accessory window mode)
+3. Be hidden from screen captures (screen capture bypass)
+
+It has been redesigned for better stability with multi-process applications like Discord, Slack, Chrome, and other Electron/Chromium-based apps.
 
 ## Key Improvements
 
-1. **Reliable Cross-Process Communication**
-   - Replaced error-prone shared memory approach with robust file-based registry
-   - Added file locking for reliable concurrent access
-   - Registry now persists across process restarts for better stability
+The 2.0 version includes major improvements for reliability and stability:
 
-2. **Enhanced Process Role Detection**
-   - Automatically identifies utility vs. UI processes based on behavior patterns
-   - Intelligently handles network service processes in Electron apps
-   - Prevents crashes in Discord's Network Service
-   - No framework-specific code - detection is based on universal process characteristics
+- **Process role detection**: Automatically detects main, renderer, utility, and service processes
+- **Registry system**: Maintains a shared registry across all processes to avoid duplicate window modifications
+- **Startup protection**: Prevents interference with critical initialization processes
+- **Window classification**: Intelligently detects utility windows vs. user interface windows
+- **Error resilience**: Enhanced error handling and recovery mechanisms
+- **Focus preservation**: Better focus management to maintain the current app's activation state
+- **Cleanup management**: Automatically cleans up stale registry entries
+- **Multi-window coordination**: Synchronizes modifications across all process windows
 
-3. **Renderer Process Protection**
-   - Added special protection for the first critical windows in renderer processes
-   - Prevents interference with Electron's network service initialization
-   - Tracks window modification count to adapt behavior based on process state
-   - Solves Discord's intermittent startup failures by protecting early windows
+## Building
 
-4. **Adaptive Startup Protection Periods**
-   - Standard 3-second protection for most processes
-   - Extended 10-second protection for renderer processes
-   - Prevents modification during critical initialization phases
-   - Tailored delays based on process role (main, renderer, utility)
+```
+make clean && make
+```
 
-5. **Window Stability Detection**
-   - Added intelligent window readiness detection that works across all application frameworks
-   - Checks for stable window dimensions, visibility, and drawing context before modification
-   - Distinguishes between utility windows and user interface windows
-   - No framework-specific code, ensuring universal compatibility
-
-6. **Progressive Retry Strategy**
-   - Implements an adaptive retry system with progressive delays for window modification
-   - First attempts immediate modification for simple applications
-   - Gradually increases retry intervals (0.1s, 0.3s, 0.6s, etc.) for complex window systems
-   - Automatically manages a retry queue for unstable windows
-
-7. **Enhanced Error Handling & Resilience**
-   - Graceful fallbacks when CGS notification registration fails
-   - Improved detection and handling of multi-process applications 
-   - Added more signal handlers to handle crashes more gracefully
-   - More robust thread management with fallbacks
-
-8. **Better Process Management**
-   - Proper cleanup of resources and stale registry data
-   - Improved process type detection for various application frameworks
-   - More informative logging for easier troubleshooting
-
-## How It Works
-
-The window modifier now uses three main techniques to detect and modify windows:
-
-1. **AppKit Method Swizzling**: Intercepts window creation in AppKit-based processes
-2. **CGS Notification System**: Receives window creation events from the window server
-3. **Periodic Window Scanning**: Fallback method that scans for windows periodically
-
-These techniques work together to ensure all windows are properly modified across multiple application processes.
+This will create:
+- `build/libwindowmodifier.dylib` - The injectable library
+- `build/injector` - A standalone injector executable (alternative to the script)
 
 ## Usage
 
-Use the launcher script to inject the window modifier into any application:
+### Basic Usage with Script (Recommended)
 
-```
-./launch_app.sh /path/to/application.app
-```
-
-Examples:
 ```
 ./launch_app.sh /Applications/Discord.app
-./launch_app.sh /Applications/Slack.app
-./launch_app.sh /Applications/Google\ Chrome.app
 ```
 
-## Window Modifications Applied
+### Debug Mode for Troubleshooting
 
-When applied, the window modifier makes the following changes to windows:
+```
+./launch_app.sh /Applications/Discord.app --debug
+```
 
-1. **Always-on-top**: Windows stay above regular application windows
-2. **Non-activating**: Windows don't steal focus when clicked
-3. **Screen capture bypass**: Windows aren't visible in screenshots/recordings
-4. **Global visibility**: Windows are visible in all Mission Control spaces
+### Manual Injection (Advanced)
 
-## Technical Notes
+```
+DYLD_INSERT_LIBRARIES=./build/libwindowmodifier.dylib DYLD_FORCE_FLAT_NAMESPACE=1 /Applications/Discord.app/Contents/MacOS/Discord
+```
 
-The system is designed to work with various multi-process application frameworks:
+## Supported Applications
 
-- Electron (Discord, Slack, VS Code, etc.)
-- Chromium (Chrome, Edge, Brave, etc.)
-- WebKit (Safari, Mail, etc.)
+Tested with:
+- Discord
+- Slack
+- Google Chrome
 - Firefox
-- And more...
+- Safari
 
-The file-based registry ensures that even if processes crash or restart, the system maintains consistent window state tracking.
+## How it Works
+
+The library uses a combination of:
+
+1. **DYLIB injection** - Loads into the target application processes
+2. **AppKit swizzling** - Intercepts window creation and updating methods
+3. **Core Graphics Services (CGS)** - Uses private Apple APIs for window modification
+4. **Inter-process registry** - Coordinated window management using a shared memory-mapped file
+
+## Technical Implementation
+
+1. **Process Classification**:
+   - Main processes: Host the application's primary logic
+   - UI processes: Render interface elements (Electron renderers, etc.)
+   - Utility processes: Background services and helpers
+   - Network processes: Handle communication tasks
+
+2. **Window Modification Strategy**:
+   - Each window undergoes safety checks before modification
+   - Modifications include setting non-activating flags, window levels, and screen sharing state
+   - Changes are tracked in a shared registry to prevent duplication
+
+3. **Window Detection Techniques**:
+   - Method swizzling for AppKit window events
+   - CGS window notifications for system-level events
+   - Periodic scanning for windows created through other means
+   - Combined approach ensures maximum window coverage
+
+## Troubleshooting
+
+If the application crashes on launch:
+- Ensure the application isn't already running
+- Try with `--debug` flag for extra logging
+- Check `*_launch.log` for detailed diagnostics
+
+If windows aren't being modified:
+- It may be a service/utility process - these are intentionally skipped
+- Some windows are protected during initial launch to prevent crashes
+- Check that the window is a standard user interface window, not a utility
+
+## Security Note
+
+This project uses private Apple APIs (CGS) and method swizzling, which are not approved for App Store distribution. This is intended as a proof-of-concept and for educational purposes only.
