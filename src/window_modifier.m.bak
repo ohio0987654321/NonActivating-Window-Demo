@@ -70,14 +70,7 @@ typedef enum {
     PROCESS_ROLE_UTILITY     // Background service process
 } process_role_t;
 
-// Window stability tracking
-typedef struct {
-    CGSWindowID windowID;
-    int attempts;
-    double next_attempt_time;
-} retry_window_t;
-
-// Global state
+// Global state - simplified
 static NSRunningApplication *previousFrontmostApp = nil;
 static window_registry_t *window_registry = NULL;
 static bool is_cgs_monitor_active = false;
@@ -87,10 +80,6 @@ static int modified_window_count = 0;
 static const int STARTUP_PROTECTION_SECONDS = 3; // Simplified protection period
 static const int UI_STARTUP_PROTECTION_SECONDS = 5; // Extra time for UI processes
 static const int MAX_PROTECTED_WINDOWS = 2; // Limit for protected windows
-static retry_window_t retry_windows[32];
-static int retry_window_count = 0;
-static double retry_delays[] = {0.1, 0.3, 0.6, 1.0, 2.0}; // Progressive delays in seconds
-static const int max_retry_attempts = 5;
 
 // Forward declarations
 static NSDictionary *getWindowInfoWithCGS(CGSWindowID windowID);
@@ -103,8 +92,6 @@ static bool isUtilityWindow(CGSWindowID windowID);
 static bool isWindowReadyForModification(CGSWindowID windowID);
 static bool isInStartupProtection(void);
 static bool modifyWindowWithCGSInternal(CGSWindowID windowID, bool isRetry);
-static void addWindowToRetryQueue(CGSWindowID windowID);
-static void processRetryQueue(void);
 
 // Save previous app
 static void saveFrontmostApp(void) {
@@ -382,132 +369,24 @@ static bool modifyWindowWithCGSInternal(CGSWindowID windowID, bool isRetry) {
 }
 
 // Apply window modifications directly using CGS APIs
-// Add a window to the retry queue
-static void addWindowToRetryQueue(CGSWindowID windowID) {
-    // Check if window is already in the queue
-    for (int i = 0; i < retry_window_count; i++) {
-        if (retry_windows[i].windowID == windowID) {
-            // Already in queue, update next attempt time
-            retry_windows[i].attempts++;
-            
-            if (retry_windows[i].attempts < max_retry_attempts) {
-                int delayIndex = retry_windows[i].attempts < 5 ? retry_windows[i].attempts : 4;
-                double delayTime = retry_delays[delayIndex];
-                
-                struct timeval tv;
-                gettimeofday(&tv, NULL);
-                double currentTime = tv.tv_sec + (tv.tv_usec / 1000000.0);
-                
-                retry_windows[i].next_attempt_time = currentTime + delayTime;
-                
-                printf("[Modifier] Window %d scheduled for retry %d in %.1f seconds\n", 
-                       windowID, retry_windows[i].attempts, delayTime);
-            } else {
-                printf("[Modifier] Window %d max retries reached, abandoning\n", windowID);
-                
-                // Remove from queue by swapping with last entry
-                retry_windows[i] = retry_windows[retry_window_count - 1];
-                retry_window_count--;
-            }
-            return;
-        }
-    }
-    
-    // Add new entry if we have space
-    if (retry_window_count < 32) {
-        retry_windows[retry_window_count].windowID = windowID;
-        retry_windows[retry_window_count].attempts = 0;
-        
-        struct timeval tv;
-        gettimeofday(&tv, NULL);
-        double currentTime = tv.tv_sec + (tv.tv_usec / 1000000.0);
-        
-        retry_windows[retry_window_count].next_attempt_time = currentTime + retry_delays[0];
-        
-        printf("[Modifier] Window %d added to retry queue (will retry in %.1f seconds)\n", 
-               windowID, retry_delays[0]);
-        
-        retry_window_count++;
-    }
-}
-
-// Process the retry queue
-static void processRetryQueue(void) {
-    if (retry_window_count == 0) {
-        return;
-    }
-    
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    double currentTime = tv.tv_sec + (tv.tv_usec / 1000000.0);
-    
-    // Process the queue from the end to make removals easier
-    for (int i = retry_window_count - 1; i >= 0; i--) {
-        if (currentTime >= retry_windows[i].next_attempt_time) {
-            CGSWindowID windowID = retry_windows[i].windowID;
-            
-            // Check if the window is ready and if so, try to modify it
-            if (isWindowReadyForModification(windowID)) {
-                if (modifyWindowWithCGSInternal(windowID, true)) {
-                    // Success! Remove from queue
-                    retry_windows[i] = retry_windows[retry_window_count - 1];
-                    retry_window_count--;
-                    printf("[Modifier] Successfully modified window %d on retry\n", windowID);
-                } else {
-                    // Failed again, update for next retry
-                    retry_windows[i].attempts++;
-                    
-                    if (retry_windows[i].attempts < max_retry_attempts) {
-                        int delayIndex = retry_windows[i].attempts < 5 ? retry_windows[i].attempts : 4;
-                        retry_windows[i].next_attempt_time = currentTime + retry_delays[delayIndex];
-                    } else {
-                        // Max retries reached, remove from queue
-                        retry_windows[i] = retry_windows[retry_window_count - 1];
-                        retry_window_count--;
-                    }
-                }
-            } else {
-                // Window not ready yet, schedule next attempt
-                retry_windows[i].next_attempt_time = currentTime + retry_delays[0];
-            }
-        }
-    }
-}
-
 static bool modifyWindowWithCGS(CGSWindowID windowID) {
     // Skip if in startup protection
     if (isInStartupProtection()) {
-        printf("[Modifier] Window %d skipped - in startup protection period\n", windowID);
-        // For main process windows during startup, add to retry queue to try later
-        if (current_process_role != PROCESS_ROLE_UTILITY) {
-            addWindowToRetryQueue(windowID);
-        }
         return false;
     }
     
     // Skip utility windows
     if (isUtilityWindow(windowID)) {
-        printf("[Modifier] Window %d skipped - detected as utility window\n", windowID);
         return false;
     }
     
-    // First check if window is ready for modification
+    // Skip if not ready
     if (!isWindowReadyForModification(windowID)) {
-        printf("[Modifier] Window %d not ready for modification, adding to retry queue\n", windowID);
-        addWindowToRetryQueue(windowID);
         return false;
     }
     
     // Try to modify the window
-    bool success = modifyWindowWithCGSInternal(windowID, false);
-    
-    // If modification failed, add to retry queue
-    if (!success) {
-        printf("[Modifier] Window %d modification failed, adding to retry queue\n", windowID);
-        addWindowToRetryQueue(windowID);
-    }
-    
-    return success;
+    return modifyWindowWithCGSInternal(windowID, false);
 }
 
 // Apply modifications to an NSWindow
@@ -534,9 +413,9 @@ static bool modifyNSWindow(NSWindow *window) {
         // 3. Screen capture bypass
         window.sharingType = NSWindowSharingNone;
         
-        // 4. Mission control compatibility - added NSWindowCollectionBehaviorManaged
-        window.collectionBehavior =  NSWindowCollectionBehaviorParticipatesInCycle |
-                                   NSWindowCollectionBehaviorManaged;
+        // 4. Mission control compatibility
+        window.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces | 
+                                   NSWindowCollectionBehaviorParticipatesInCycle;
     }
     @catch (NSException *exception) {
         return false;
@@ -719,27 +598,8 @@ static bool initWindowModifier(void) {
             // Set up notification observers
             setupWindowObserver();
             
-            // Temporarily set app to regular mode for Mission Control display
-            if ([NSApp respondsToSelector:@selector(setActivationPolicy:)]) {
-                [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
-            }
-            
-            // Apply window modification with a small delay
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), 
-                           dispatch_get_main_queue(), ^{
-                applyAllWindowModifications();
-                
-                // Return to accessory app mode
-                if ([NSApp respondsToSelector:@selector(setActivationPolicy:)]) {
-                    [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
-                    printf("[Modifier] Application set to accessory mode\n");
-                }
-            });
-        } else {
-            printf("[Modifier] NSApp not available, using CGS-only approach\n");
-            // If NSApp is not available, this is likely a non-AppKit process
-            // Apply initial CGS scan
-            scanExistingWindowsWithCGS();
+            // Apply initial modifications
+            applyAllWindowModifications();
         }
     });
     
@@ -753,23 +613,9 @@ void* window_modifier_main(void* arg) {
     
     initWindowModifier();
     
-    // Wait a bit for initial setup
-    sleep(1);
-    
-    // Main monitoring loop with retry queue processing
+    // Main monitoring loop - simplified
     while (1) {
-        // Wait less time when we have pending windows
-        if (retry_window_count > 0) {
-            // Check more frequently when we have windows in retry queue
-            usleep(500000); // 0.5 seconds
-        } else {
-            sleep(2); // Standard interval
-        }
-        
-        // Process any windows in the retry queue that are ready
-        if (retry_window_count > 0) {
-            processRetryQueue();
-        }
+        sleep(2);
         
         // Periodically scan for new windows
         applyAllWindowModifications();
