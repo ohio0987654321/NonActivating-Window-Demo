@@ -6,7 +6,6 @@
 // Global state for classifier
 static NSMutableDictionary *windowClassCache = nil;
 static NSMutableDictionary *windowInitStateCache = nil;
-static window_class_callback_t classificationCallback = NULL;
 
 // Forward declarations
 static window_class_t classifyWindowWithInfo(CGSWindowID windowID, NSDictionary *windowInfo);
@@ -27,13 +26,6 @@ void cleanup_window_classifier(void) {
     // Release caches
     windowClassCache = nil;
     windowInitStateCache = nil;
-    
-    classificationCallback = NULL;
-}
-
-// Register for window classification
-void register_classification_callback(window_class_callback_t callback) {
-    classificationCallback = callback;
 }
 
 // Track window event
@@ -57,11 +49,6 @@ void track_window_event(CGSWindowID windowID, int eventType) {
             NSNumber *key = @(windowID);
             NSNumber *value = @(classification);
             [windowClassCache setObject:value forKey:key];
-            
-            // Notify callback if registered
-            if (classificationCallback) {
-                classificationCallback(windowID, classification);
-            }
         }
     }
 }

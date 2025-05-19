@@ -1,112 +1,76 @@
-# Window Modifier Refactoring
+# Window Modifier Refactoring Documentation
 
 ## Overview
 
-The Window Modifier project has been refactored to address several key issues, making it more robust for general macOS applications rather than only supporting specific multi-process applications like Discord and Electron apps. This document outlines the changes made and provides guidelines for future development.
+This document details the refactoring work performed to transform the Window Modifier project from a Discord-specific tool to a universal macOS application window modifier. The refactoring focused on removing application-specific code, generalizing detection algorithms, and streamlining the codebase.
 
-## Key Improvements
+## Completed Refactoring Tasks
 
-### 1. Generic Window Handling
+### 1. Directory Structure Reorganization
 
-The code now properly handles windows with different ownership patterns:
-- Standard application windows
-- Windows with special ownership (Owner ID 0)
-- Windows from various process types
+- Created a logical modular structure:
+  - `src/core/`: Core functionality and types
+  - `src/operations/`: Window modification operations
+  - `src/tracker/`: Window tracking and classification
+  - `src/cgs/`: Core Graphics Services wrappers
 
-### 2. Event-Driven Initialization (No More Time-Based Fallbacks)
+- Removed duplicated files in the root directory:
+  - Moved `src/injection_entry.c` → `src/core/injection_entry.c`
+  - Moved `src/window_modifier.m` → `src/operations/window_modifier.m`
+  - Moved `src/window_registry.c|h` → `src/tracker/window_registry.c|h`
 
-- Removed the arbitrary time threshold for initializing windows
-- Implemented a robust event-based state machine tracking window initialization events
-- Properly tracks standard vs. utility windows for informed decisions
+### 2. Removal of Discord-specific Code
 
-### 3. Multiple Modification Methods
+- Generalized process detection logic in `src/injector.c` to work with any macOS application
+- Replaced hard-coded Discord window checks with generalized window classification
+- Removed Discord-specific handling in the window modification logic
+- Implemented generic process role detection based on common macOS application patterns
 
-Windows are now modified using multiple approaches for maximum compatibility:
+### 3. Code Cleanup and Simplification
 
-- **CGS API**: Primary approach for standard windows
-- **NSWindow Approach**: For special windows with Owner ID 0
-- **Method Swizzling**: Direct intervention during window creation
+- Removed unused callback functionality from window_classifier
+- Consolidated type definitions in `window_modifier_types.h`
+- Improved error handling for better compatibility with various application types
+- Added the window_registry_t opaque type definition to window_modifier_types.h
 
-### 4. Window Classification System
+### 4. Enhanced Compatibility
 
-Improved window classification based on:
-- Window properties (size, style, level)
-- Process role detection (main, UI, utility)
-- Ownership patterns
+- Added support for screen recording bypass with improved detection
+- Improved NSWindow modification approach for better compatibility
+- Added more robust retry mechanisms for window modification
+- Enhanced initialization state detection for all macOS application types
 
-## Technical Details
+## Future Enhancements
 
-### Method Swizzling
+1. **Further Code Cleanup**
+   - Continue simplifying the window classification system
+   - Remove any remaining unused functions or parameters
+   - Consolidate duplicate functionality
 
-Added a new component that swizzles NSWindow's initialization methods to directly modify windows as they're being created, bypassing ownership issues completely. This approach handles special cases where CGS APIs are insufficient.
+2. **Performance Improvements**
+   - Optimize window detection algorithms
+   - Reduce memory usage in the window registry system
+   - Implement more efficient CGS function caching
 
-### NSWindow Modification
+3. **Additional Features**
+   - Window transparency control
+   - Enhanced virtual desktop integration
+   - Per-application configuration profiles
+   - User interface for controlling window behavior
 
-Direct AppKit-based window modification is now used when the CGS approach fails, particularly for Owner ID 0 windows:
+4. **Testing Expansion**
+   - Test with wider range of macOS applications
+   - Create test suite for different window scenarios
+   - Add single-window injection option
 
-```objc
-window.level = NSFloatingWindowLevel;
-window.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces;
-[window _setPreventsActivation:YES];
-```
+## Project Status
 
-### Improved Window Classification
+The project is now a universal window modifier capable of working with any macOS application rather than being limited to Discord or other Electron apps. The core functionality includes:
 
-Windows are now properly classified by:
-- Size (small windows are treated as utility windows)
-- Style masks (panels, sheets, utility windows recognized)
-- Event sequence (creation, ordering, resizing, updates)
+1. **Universal compatibility**: Works with standard macOS apps, Electron apps, and multi-process applications
+2. **Always-on-top windows**: Sets windows to float above other applications
+3. **Focus preservation**: Prevents windows from stealing focus when clicked
+4. **Screen recording bypass**: Enhances privacy by preventing windows from appearing in screen recordings
+5. **Mission Control integration**: Works properly with macOS window management features
 
-### Safe Modification Timing
-
-Added safe delayed modification to allow windows to complete construction before attempting modification:
-
-```objc
-dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
-    // Window modification code
-});
-```
-
-## Directory Structure
-
-```
-src/
-├── core/            # Core data types and entry points
-├── cgs/             # Core Graphics Services (CGS) API interfaces
-├── operations/      # Main window operations (including new swizzling)
-└── tracker/         # Window tracking and registry functionality
-```
-
-## Future Development Guidelines
-
-1. **General Application Support**:
-   - Avoid Discord or Electron-specific assumptions
-   - Use robust detection methods for all window types
-   - Maintain compatibility with standard macOS applications
-
-2. **Event-Driven Architecture**:
-   - Continue using the event-driven approach for window state tracking
-   - Avoid time-based fallbacks whenever possible
-   - Use the state machine pattern for tracking initialization
-
-3. **Layered Modification Approach**:
-   - Try multiple strategies in sequence (NSWindow → CGS → direct manipulation)
-   - Make decisions based on window classification
-   - Use retry mechanisms for unstable windows
-
-4. **Testing Methodology**:
-   - Test with various application types:
-     - Standard single-process macOS apps
-     - Multi-process Electron apps
-     - System utilities with special window permissions
-     - Applications with customized window handling
-
-## Known Limitations
-
-1. Some system windows with special permissions may still resist modification
-2. Applications with custom window management might require additional strategies
-3. Method swizzling may not work for all application architectures
-
-## Conclusion
-
-This refactoring transforms the window modifier from a Discord/Electron-specific solution into a general-purpose tool for macOS applications. The multi-layered approach using both CGS APIs and AppKit provides maximum compatibility and reliability.
+All the application-specific code has been removed, and the project now detects and adapts to different application architectures automatically.

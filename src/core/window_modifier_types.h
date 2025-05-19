@@ -4,6 +4,9 @@
 
 #import <CoreGraphics/CoreGraphics.h>
 
+// Window registry opaque type
+typedef struct window_registry window_registry_t;
+
 // Process role detection - simplified to three essential roles
 typedef enum {
     PROCESS_ROLE_MAIN,       // Main application process
