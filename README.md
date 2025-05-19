@@ -14,6 +14,7 @@ The project has been refactored to work with all macOS applications, regardless 
 
 ## Key Features
 
+- **Universal binary support**: Fully compatible with Apple Silicon (arm64, arm64e) and Intel (x86_64) processors
 - **Universal application support**: Works with standard macOS applications, Electron apps, and complex multi-process applications
 - **Process role detection**: Automatically detects main, renderer, utility, and service processes
 - **Cross-process registry system**: Maintains a shared registry across all processes to avoid duplicate window modifications
@@ -26,6 +27,18 @@ The project has been refactored to work with all macOS applications, regardless 
 - **Virtual desktop support**: Windows can appear on all spaces or respect virtual desktop boundaries
 - **Retry mechanism**: Automatically retries failed window modifications with exponential backoff
 
+## Recent Refactoring Improvements
+
+The codebase has been refactored with the following enhancements:
+
+1. **Centralized Type System**: All shared types are now defined in `common_types.h` to eliminate duplication and improve consistency
+2. **Enhanced Architecture Support**: Better CPU architecture detection for native performance on all Mac systems
+3. **Improved Error Handling**: Added comprehensive error reporting and recovery mechanisms
+4. **Better Code Organization**: Restructured code with logical sections and proper forward declarations
+5. **Centralized Constants**: Common constants and flags moved to shared header files
+
+For a detailed list of changes, see [REFACTORING.md](REFACTORING.md)
+
 ## Building
 
 ```
@@ -33,28 +46,28 @@ make clean && make
 ```
 
 This will create:
-- `build/libwindowmodifier.dylib` - The injectable library
-- `build/injector` - A standalone injector executable
+- `build/libwindowmodifier.dylib` - The injectable library (Universal binary for x86_64/arm64/arm64e)
+- `build/injector` - A standalone injector executable (Universal binary for x86_64/arm64/arm64e)
 
 ## Usage
 
 ### Basic Usage
 
 ```
-./build/injector /Applications/TargetApp.app/Contents/MacOS/TargetApp
-```
-
-**Important:** Always specify the direct path to the executable within the .app bundle, not just the app bundle itself. For example:
-
-```
-# Correct usage:
-./build/injector /Applications/TargetApp.app/Contents/MacOS/TargetApp
-
-# Not recommended (may work but less reliable):
 ./build/injector /Applications/TargetApp.app
 ```
 
-This direct approach ensures more reliable injection and is the preferred method.
+Or for more direct control:
+
+```
+./build/injector /Applications/TargetApp.app/Contents/MacOS/TargetApp
+```
+
+### Debug Mode
+
+```
+./build/injector /Applications/TargetApp.app --debug
+```
 
 ### Manual Injection (Alternative)
 
@@ -63,6 +76,16 @@ You can also manually inject using the DYLD_INSERT_LIBRARIES environment variabl
 ```
 DYLD_INSERT_LIBRARIES=./build/libwindowmodifier.dylib DYLD_FORCE_FLAT_NAMESPACE=1 /Applications/TargetApp.app/Contents/MacOS/TargetApp
 ```
+
+## Supported Architectures
+
+The window modifier now builds as a true universal binary with support for:
+
+- **Intel x86_64**: All Intel Macs
+- **Apple Silicon arm64**: Base M1/M2 systems
+- **Apple Silicon arm64e**: M1 Pro, M1 Max, M1 Ultra, M2 Pro, M2 Max, etc.
+
+The architecture detection is automatic and ensures optimal compatibility across all Mac systems.
 
 ## Supported Applications
 
@@ -153,7 +176,8 @@ The project has been refactored for better organization and broader compatibilit
 
 - `src/core/`: Core functionality and entry points
   - `src/core/injection_entry.c`: Entry point for dylib injection
-  - `src/core/window_modifier_types.h`: Common type definitions
+  - `src/core/common_types.h`: Centralized type definitions
+  - `src/core/window_modifier_types.h`: Additional window-specific types
 - `src/operations/`: Window operations implementation
   - `src/operations/window_modifier.m`: Core window modification logic
   - `src/operations/window_modifier.h`: Public API for window modification
@@ -167,7 +191,7 @@ The project has been refactored for better organization and broader compatibilit
 - `src/cgs/`: Core Graphics Services wrapper
   - `src/cgs/window_modifier_cgs.m`: CGS API implementations
   - `src/cgs/window_modifier_cgs.h`: CGS function declarations
-- `src/injector.c`: Command-line injection utility
+- `src/injector.c`: Command-line injection utility with enhanced architecture detection
 
 ## Security Note
 

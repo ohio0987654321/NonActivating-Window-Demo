@@ -3,7 +3,7 @@
 #define WINDOW_CLASSIFIER_H
 
 #import <Cocoa/Cocoa.h>
-#include "../core/window_modifier_types.h"
+#include "../core/common_types.h"
 
 // Window classifier interface
 bool init_window_classifier(void);

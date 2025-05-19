@@ -1,4 +1,4 @@
-// injector.c - For all macOS applications
+// injector.c - Universal injector for all macOS applications with arch detection
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,6 +13,8 @@
 #include <libproc.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <time.h>
+#include <sys/types.h>
+#include <sys/sysctl.h>
 
 // Constants for registry paths
 #define REGISTRY_DIR "/tmp/window_modifier"
@@ -390,9 +392,94 @@ static int injectDylib(const char *executablePath, const char *dylibPath, bool w
 }
 
 /**
+ * Get the CPU architecture of the current system
+ * Returns a string representing the architecture: "x86_64", "arm64", "arm64e", or "unknown"
+ */
+static const char* detectCPUArchitecture(void) {
+    // Method 1: Use native macOS APIs (most reliable)
+    char buffer[128];
+    size_t size = sizeof(buffer);
+    
+    // Get the machine hardware name
+    if (sysctlbyname("hw.machine", buffer, &size, NULL, 0) == 0) {
+        printf("Hardware machine: %s\n", buffer);
+        
+        // Check for ARM-based Macs with specific models
+        if (strncmp(buffer, "arm64e", 6) == 0) {
+            return "arm64e";  // M1 Pro, M1 Max, M1 Ultra, M2 etc.
+        }
+        else if (strncmp(buffer, "arm64", 5) == 0) {
+            return "arm64";   // Base M1
+        }
+    }
+    
+    // Method 2: Get the CPU type and subtype as a fallback
+    size = sizeof(buffer);
+    if (sysctlbyname("hw.cputype", buffer, &size, NULL, 0) == 0) {
+        unsigned int cpu_type = *(unsigned int*)buffer;
+        
+        size = sizeof(buffer);
+        if (sysctlbyname("hw.cpusubtype", buffer, &size, NULL, 0) == 0) {
+            unsigned int cpu_subtype = *(unsigned int*)buffer;
+            printf("CPU type: 0x%08x, subtype: 0x%08x\n", cpu_type, cpu_subtype);
+            
+            // CPU_TYPE_X86_64 is 0x01000007
+            if (cpu_type == 0x01000007) {
+                return "x86_64";
+            } 
+            // CPU_TYPE_ARM64 is 0x0100000c
+            else if (cpu_type == 0x0100000c) {
+                // CPU_SUBTYPE_ARM64E is 2
+                if (cpu_subtype == 2) {
+                    return "arm64e";
+                }
+                return "arm64";
+            }
+        }
+    }
+    
+    // Method 3: Use NXGetLocalArchInfo() if available via dyld
+    #if defined(__APPLE__)
+    // The following code attempts to use NXGetLocalArchInfo() but is wrapped in
+    // preprocessor directives to avoid link-time errors
+    #ifdef HAVE_NXGETLOCALARCHINFO
+    #include <mach-o/arch.h>
+    const NXArchInfo *archInfo = NXGetLocalArchInfo();
+    if (archInfo != NULL) {
+        printf("Arch info name: %s, description: %s\n", 
+               archInfo->name, archInfo->description);
+        
+        if (strcmp(archInfo->name, "x86_64") == 0) {
+            return "x86_64";
+        } else if (strcmp(archInfo->name, "arm64") == 0) {
+            return "arm64";
+        } else if (strcmp(archInfo->name, "arm64e") == 0) {
+            return "arm64e";
+        }
+    }
+    #endif
+    #endif
+    
+    // Method 4: Use compiler-defined macros as last resort
+    #ifdef __x86_64__
+        return "x86_64";
+    #elif defined(__arm64e__)
+        return "arm64e";
+    #elif defined(__arm64__) || defined(__aarch64__)
+        return "arm64";
+    #else
+        return "unknown";
+    #endif
+}
+
+/**
  * Main entry point
  */
 int main(int argc, char *argv[]) {
+    // Detect system architecture
+    const char* arch = detectCPUArchitecture();
+    printf("Detected CPU Architecture: %s\n", arch);
+    
     // Check command line arguments
     if (argc < 2) {
         printf("Usage: %s /path/to/application.(app|executable) [--debug]\n", argv[0]);

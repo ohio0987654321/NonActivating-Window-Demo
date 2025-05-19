@@ -1,7 +1,9 @@
-# Makefile for the window modifier
+# Makefile for the universal window modifier
 CC=clang
-CFLAGS=-Wall -Wextra -g -fPIC -ObjC -fobjc-arc
-LDFLAGS=-dynamiclib -framework Cocoa -framework AppKit -framework CoreFoundation
+# Architecture flags for universal binary (x86_64, arm64, arm64e)
+ARCH_FLAGS=-arch x86_64 -arch arm64 -arch arm64e
+CFLAGS=-Wall -Wextra -g -fPIC -ObjC -fobjc-arc $(ARCH_FLAGS)
+LDFLAGS=-dynamiclib -framework Cocoa -framework AppKit -framework CoreFoundation $(ARCH_FLAGS)
 
 # Directories
 SRC_DIR=src

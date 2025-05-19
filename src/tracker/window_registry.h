@@ -3,7 +3,7 @@
 #define WINDOW_REGISTRY_H
 
 #include <stdbool.h>
-#include "../core/window_modifier_types.h"
+#include "../core/common_types.h"
 
 // Window registry opaque type
 typedef struct window_registry window_registry_t;

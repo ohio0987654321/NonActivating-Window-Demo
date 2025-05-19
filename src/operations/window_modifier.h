@@ -4,7 +4,7 @@
 
 #import <Cocoa/Cocoa.h>
 #import "../tracker/window_registry.h"
-#include "../core/window_modifier_types.h"
+#include "../core/common_types.h"
 
 // Main thread function
 void* window_modifier_main(void* arg);

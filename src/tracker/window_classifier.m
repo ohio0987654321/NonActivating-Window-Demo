@@ -1,6 +1,7 @@
 // window_classifier.m - Window classification and tracking
 #import "window_classifier.h"
 #import "../cgs/window_modifier_cgs.h"
+#import "../core/common_types.h"
 #import <objc/runtime.h>
 
 // Global state for classifier

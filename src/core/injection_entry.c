@@ -8,7 +8,9 @@
 #include <stdbool.h>
 #include <mach-o/dyld.h>
 
-// Forward declarations instead of includes to avoid circular dependencies
+#include "common_types.h" // Centralized type definitions
+
+// Forward declarations for external components
 extern bool init_window_classifier(void);
 extern void cleanup_window_classifier(void);
 extern void* window_modifier_main(void* arg);

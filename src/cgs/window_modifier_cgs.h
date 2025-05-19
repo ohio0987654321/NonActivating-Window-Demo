@@ -3,7 +3,7 @@
 #define WINDOW_MODIFIER_CGS_H
 
 #import <Cocoa/Cocoa.h>
-#include "../core/window_modifier_types.h"
+#include "../core/common_types.h"
 
 // CGS function pointers
 extern CGSConnectionID (*CGSDefaultConnection_ptr)(void);
