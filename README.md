@@ -1,26 +1,29 @@
-# Window Modifier for macOS Applications
+# Universal Window Modifier for macOS Applications
 
 ## Overview
 
-This proof-of-concept (PoC) project creates a window modifier library that can be injected into macOS applications. It enables windows to:
+This project creates a window modifier library that can be injected into any macOS application. It enables windows to:
 
 1. Stay on top of other applications (always-on-top)
 2. Not steal focus when clicked on (accessory window mode)
-3. Be hidden from screen captures (screen capture bypass)
+3. Bypass screen recording detection (privacy enhancement)
 4. Properly integrate with Mission Control and virtual desktops
+5. Work universally across all application architectures (standard macOS apps, single-process, multi-process, and Electron-based applications)
 
-The project has been redesigned for better stability with multi-process applications like Discord, Slack, Chrome, and other Electron/Chromium-based apps.
+The project has been refactored to work with all macOS applications, regardless of their architecture or design pattern, eliminating any dependencies on specific frameworks or application structures.
 
 ## Key Features
 
+- **Universal application support**: Works with standard macOS applications, Electron apps, and complex multi-process applications
 - **Process role detection**: Automatically detects main, renderer, utility, and service processes
-- **Registry system**: Maintains a shared registry across all processes to avoid duplicate window modifications
+- **Cross-process registry system**: Maintains a shared registry across all processes to avoid duplicate window modifications
 - **Startup protection**: Prevents interference with critical initialization processes
 - **Window classification**: Intelligently detects utility windows vs. user interface windows
+- **Screen recording bypass**: Prevents windows from being captured in screen recordings
 - **Error resilience**: Enhanced error handling and recovery mechanisms
 - **Focus preservation**: Better focus management to maintain the current app's activation state
-- **Mission Control integration**: Windows properly appear in Mission Control
-- **Virtual desktop support**: Windows respect virtual desktop boundaries rather than appearing in fixed positions
+- **Mission Control integration**: Windows properly appear in Mission Control and Exposé
+- **Virtual desktop support**: Windows can appear on all spaces or respect virtual desktop boundaries
 - **Retry mechanism**: Automatically retries failed window modifications with exponential backoff
 
 ## Building
@@ -45,10 +48,10 @@ This will create:
 
 ```
 # Correct usage:
-./build/injector /Applications/Discord.app/Contents/MacOS/Discord
+./build/injector /Applications/TargetApp.app/Contents/MacOS/TargetApp
 
 # Not recommended (may work but less reliable):
-./build/injector /Applications/Discord.app
+./build/injector /Applications/TargetApp.app
 ```
 
 This direct approach ensures more reliable injection and is the preferred method.
@@ -63,21 +66,41 @@ DYLD_INSERT_LIBRARIES=./build/libwindowmodifier.dylib DYLD_FORCE_FLAT_NAMESPACE=
 
 ## Supported Applications
 
-Tested with:
+The refactored design works with virtually all macOS applications:
+
+### Standard macOS Applications
+- Safari, Mail, Notes, and other native apps
+- Professional applications like XCode, Final Cut Pro, Logic Pro
+
+### Electron-based Applications
 - Discord
 - Slack
+- Visual Studio Code
+- Microsoft Teams
+
+### Chromium-based Browsers
 - Google Chrome
+- Microsoft Edge
+- Brave Browser
+
+### Mozilla Applications
 - Firefox
-- Safari
+
+### Qt and Cross-platform Applications
+- VLC
+- Audacity
+- GIMP
 
 ## How it Works
 
-The library uses a combination of:
+The library uses a layered approach to maximize compatibility:
 
-1. **DYLIB injection** - Loads into the target application processes
-2. **AppKit swizzling** - Intercepts window creation and updating methods
-3. **Core Graphics Services (CGS)** - Uses private Apple APIs for window modification
-4. **Inter-process registry** - Coordinated window management using a shared memory-mapped file
+1. **DYLIB injection** - Loads into all target application processes
+2. **AppKit integration** - Works with standard macOS window system
+3. **Method swizzling** - Intercepts window creation and updating methods
+4. **Core Graphics Services (CGS)** - Uses private Apple APIs for window modification
+5. **Inter-process registry** - Coordinates window management using a shared memory-mapped file
+6. **Automatic Process Detection** - Adapts behavior based on process type
 
 ## Technical Implementation
 
@@ -103,6 +126,10 @@ The library uses a combination of:
    - Exponential backoff for retry attempts
    - Window readiness verification before retry attempts
 
+5. **Screen Recording Bypass**:
+   - Uses window sharing state APIs to prevent windows from appearing in screen recordings
+   - Applies different techniques based on window type and ownership
+
 ## Troubleshooting
 
 If the application crashes on launch:
@@ -115,12 +142,32 @@ If windows aren't being modified:
 - Some windows are protected during initial launch to prevent crashes
 - Check that the window is a standard user interface window, not a utility
 
+If a specific feature isn't working:
+- **Screen recording bypass**: May be blocked by high security applications or system security policies
+- **Mission Control display**: Make sure the window has the correct collection behavior flags
+- **Always-on-top**: Might be overridden by system windows or full-screen applications
+
 ## Project Structure
 
-- `src/window_modifier.m`: Core window modification logic
-- `src/injection_entry.c`: Entry point for dylib injection
+The project has been refactored for better organization and broader compatibility:
+
+- `src/core/`: Core functionality and entry points
+  - `src/core/injection_entry.c`: Entry point for dylib injection
+  - `src/core/window_modifier_types.h`: Common type definitions
+- `src/operations/`: Window operations implementation
+  - `src/operations/window_modifier.m`: Core window modification logic
+  - `src/operations/window_modifier.h`: Public API for window modification
+  - `src/operations/window_modifier_swizzle.m`: Method swizzling implementation
+  - `src/operations/window_modifier_swizzle.h`: Method swizzling interface
+- `src/tracker/`: Window and process tracking
+  - `src/tracker/window_registry.c`: Shared registry for cross-process coordination
+  - `src/tracker/window_registry.h`: Registry interface
+  - `src/tracker/window_classifier.m`: Window type detection and classification
+  - `src/tracker/window_classifier.h`: Window classification interface
+- `src/cgs/`: Core Graphics Services wrapper
+  - `src/cgs/window_modifier_cgs.m`: CGS API implementations
+  - `src/cgs/window_modifier_cgs.h`: CGS function declarations
 - `src/injector.c`: Command-line injection utility
-- `src/window_registry.c`: Shared registry for cross-process coordination
 
 ## Security Note
 

@@ -1,4 +1,4 @@
-// injector.c - Enhanced for multi-process applications
+// injector.c - For all macOS applications
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,28 +18,42 @@
 #define REGISTRY_DIR "/tmp/window_modifier"
 #define REGISTRY_FILE "registry.dat"
 
-// Application patterns
+// Process Types - Classification for application architecture
+typedef enum {
+    PROCESS_TYPE_STANDARD,       // Standard single-process app (most macOS applications)
+    PROCESS_TYPE_MULTI_PROCESS,  // App with multiple processes architecture
+    PROCESS_TYPE_AGENT           // Background agent or daemon process
+} process_type_t;
+
+// Process identification and detection
 typedef struct {
-    const char *appName;
-    const char *mainExe;
-    const char **additionalExes;
-    bool isMultiProcess;
-} AppPattern;
+    const char *processName;       // Process name pattern
+    process_type_t processType;    // Type of process
+} ProcessPattern;
 
-// List of known multi-process applications and their patterns
-static const char *electronExes[] = {"Helper", "GPU", "Renderer", "Plugin", NULL};
-static const char *chromeExes[] = {"Renderer", "GPU Process", "Plugin", "Utility", NULL};
-static const char *safariExes[] = {"WebProcess", "GPUProcess", "NetworkProcess", "PluginProcess", NULL};
-static const char *firefoxExes[] = {"Web Content", "GPU Process", "RDD Process", "Socket Process", NULL};
-
-// We'll keep these patterns available for future enhancements
-static const AppPattern knownApps[] __attribute__((unused)) = {
-    {"Discord", "Discord", electronExes, true},
-    {"Slack", "Slack", electronExes, true},
-    {"Chrome", "Google Chrome", chromeExes, true},
-    {"Safari", "Safari", safariExes, true},
-    {"Firefox", "firefox", firefoxExes, true},
-    {NULL, NULL, NULL, false} // Sentinel
+// Common process architectural patterns
+// This detects common patterns across macOS applications
+// No application-specific patterns should be here
+static const ProcessPattern knownPatterns[] = {
+    // Multi-process architecture indicators - found in many modern macOS apps
+    {"Helper", PROCESS_TYPE_MULTI_PROCESS},
+    {"GPU", PROCESS_TYPE_MULTI_PROCESS},
+    {"Renderer", PROCESS_TYPE_MULTI_PROCESS},
+    {"WebProcess", PROCESS_TYPE_MULTI_PROCESS},
+    {"WebContent", PROCESS_TYPE_MULTI_PROCESS},
+    
+    // Services and agents
+    {"Agent", PROCESS_TYPE_AGENT},
+    {"Service", PROCESS_TYPE_AGENT},
+    {"Daemon", PROCESS_TYPE_AGENT},
+    
+    // Framework processes
+    {"XPC", PROCESS_TYPE_MULTI_PROCESS},
+    {"Extension", PROCESS_TYPE_MULTI_PROCESS},
+    {"Plugin", PROCESS_TYPE_MULTI_PROCESS},
+    
+    // Default - all other apps
+    {NULL, PROCESS_TYPE_STANDARD}  // Sentinel
 };
 
 // Path to our DYLIB
@@ -105,6 +119,29 @@ static bool isValidAppPath(const char *path) {
 }
 
 /**
+ * Detects the type of application based on its executable name and structure
+ */
+static process_type_t detectProcessType(const char *executablePath) {
+    const char *execName = strrchr(executablePath, '/');
+    execName = execName ? execName + 1 : executablePath;
+    
+    // Check against known patterns
+    for (int i = 0; knownPatterns[i].processName != NULL; i++) {
+        if (strstr(execName, knownPatterns[i].processName) != NULL) {
+            return knownPatterns[i].processType;
+        }
+    }
+    
+    // If executable is in a standard macOS app bundle, it's likely a standard app
+    if (strstr(executablePath, ".app/Contents/MacOS/") != NULL) {
+        return PROCESS_TYPE_STANDARD;
+    }
+    
+    // Default to standard
+    return PROCESS_TYPE_STANDARD;
+}
+
+/**
  * Finds the main executable in an .app bundle or validates a direct executable path
  */
 static bool findMainExecutable(const char *appPath, char *exePath, size_t maxLen) {
@@ -116,19 +153,18 @@ static bool findMainExecutable(const char *appPath, char *exePath, size_t maxLen
         return true;
     }
     
+    // Check if it's a direct path to an executable inside a bundle
+    if (strstr(appPath, "/Contents/MacOS/") != NULL) {
+        if (stat(appPath, &s) == 0 && S_ISREG(s.st_mode) && isExecutable(appPath)) {
+            printf("Using executable in app bundle: %s\n", appPath);
+            strncpy(exePath, appPath, maxLen);
+            return true;
+        }
+    }
+    
     // For .app bundles, construct the path to the main executable
     if (strstr(appPath, ".app") != NULL) {
-        // Check if path already includes Contents/MacOS/ and points to an executable
-        if (strstr(appPath, "/Contents/MacOS/") != NULL) {
-            // This might be a direct path to the executable inside the bundle
-            if (stat(appPath, &s) == 0 && S_ISREG(s.st_mode) && isExecutable(appPath)) {
-                printf("Using executable in app bundle: %s\n", appPath);
-                strncpy(exePath, appPath, maxLen);
-                return true;
-            }
-        }
-        
-        // Otherwise, try to find the executable in the bundle
+        // Try to find the executable in the bundle
         char macOSPath[PATH_MAX];
         snprintf(macOSPath, sizeof(macOSPath), "%s/Contents/MacOS", appPath);
         
@@ -232,11 +268,30 @@ static void cleanupRegistry(void) {
 }
 
 /**
- * Enhanced DYLIB injection with environment setup
+ * Enhanced DYLIB injection with robust error handling for all macOS applications
  */
 static int injectDylib(const char *executablePath, const char *dylibPath, bool waitForExit) {
-    // Validate inputs
-    if (!executablePath || !dylibPath) {
+    // Validate inputs with detailed error reporting
+    if (!executablePath) {
+        fprintf(stderr, "Error: No executable path provided for injection\n");
+        return 1;
+    }
+    
+    if (!dylibPath) {
+        fprintf(stderr, "Error: No DYLIB path provided for injection\n");
+        return 1;
+    }
+    
+    // Verify executable exists and has proper permissions
+    if (access(executablePath, F_OK) != 0) {
+        fprintf(stderr, "Error: Executable not found: %s (errno: %d - %s)\n", 
+                executablePath, errno, strerror(errno));
+        return 1;
+    }
+    
+    if (access(executablePath, X_OK) != 0) {
+        fprintf(stderr, "Error: Executable not executable: %s (errno: %d - %s)\n", 
+                executablePath, errno, strerror(errno));
         return 1;
     }
     
@@ -290,9 +345,16 @@ static int injectDylib(const char *executablePath, const char *dylibPath, bool w
     pid_t pid;
     int status;
     
-    printf("Launching %s with modifier...\n", execName);
+    printf("Launching %s with window modifier...\n", execName);
     printf("DYLIB: %s\n", dylibPath);
     printf("Executable: %s\n", executablePath);
+    
+    // Detect process type for logging
+    process_type_t processType = detectProcessType(executablePath);
+    printf("Detected process type: %s\n", 
+           processType == PROCESS_TYPE_MULTI_PROCESS ? "Multi-process application" : 
+           processType == PROCESS_TYPE_AGENT ? "Agent/service process" : 
+           "Standard application");
     
     // Launch the process using posix_spawnp
     status = posix_spawnp(&pid, executablePath, NULL, NULL, args, newEnv);
@@ -328,70 +390,16 @@ static int injectDylib(const char *executablePath, const char *dylibPath, bool w
 }
 
 /**
- * Wait for processes to initialize and show status
- * 
- * Note: This function is kept for future functionality but not currently used
- */
-static void waitForProcessInitialization(pid_t mainPid) __attribute__((unused));
-static void waitForProcessInitialization(pid_t mainPid) {
-    printf("Waiting for processes to initialize...\n");
-    
-    // Wait for initial startup
-    usleep(1000000); // 1 second
-    
-    // Check if main process is still running
-    if (kill(mainPid, 0) != 0) {
-        printf("Warning: Main process %d terminated prematurely\n", mainPid);
-        return;
-    }
-    
-    // Count child processes - important for multi-process apps
-    int childCount = 0;
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "pgrep -P %d | wc -l", mainPid);
-    
-    FILE *fp = popen(cmd, "r");
-    if (fp) {
-        char buffer[32];
-        if (fgets(buffer, sizeof(buffer), fp)) {
-            childCount = atoi(buffer);
-        }
-        pclose(fp);
-    }
-    
-    if (childCount > 0) {
-        printf("Detected %d child processes - good sign for multi-process apps\n", childCount);
-    } else {
-        printf("No child processes detected yet - app may be single-process or still initializing\n");
-    }
-    
-    // Wait a little longer for full initialization
-    usleep(2000000); // 2 seconds
-    
-    // Check again
-    if (kill(mainPid, 0) != 0) {
-        printf("Warning: Main process %d terminated during initialization\n", mainPid);
-        return;
-    }
-    
-    printf("\nWindow modifier should now be active on all application windows.\n");
-    printf("You should see:\n");
-    printf("- Windows that stay on top of other applications\n");
-    printf("- Windows that don't steal focus when clicked\n");
-    printf("- Windows that are hidden in screenshots (test with ⌘+Shift+4)\n\n");
-}
-
-/**
  * Main entry point
  */
 int main(int argc, char *argv[]) {
     // Check command line arguments
     if (argc < 2) {
         printf("Usage: %s /path/to/application.(app|executable) [--debug]\n", argv[0]);
+        printf("Description: Makes windows of the specified application float on top and non-activating.\n");
         printf("Examples:\n");
-        printf("  %s /Applications/Discord.app\n", argv[0]);
-        printf("  %s /Applications/Slack.app\n", argv[0]);
-        printf("  %s /Applications/Google\\ Chrome.app --debug\n", argv[0]);
+        printf("  %s /Applications/YourApp.app\n", argv[0]);
+        printf("  %s /Applications/AnotherApp.app --debug\n", argv[0]);
         return 1;
     }
     

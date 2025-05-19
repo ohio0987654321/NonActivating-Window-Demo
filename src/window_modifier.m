@@ -1,9 +1,11 @@
-// window_modifier.m - Enhanced for multi-process applications
+// window_modifier.m - Enhanced for all macOS applications
 #import <AppKit/AppKit.h>
 #import <objc/runtime.h>
 #import <dlfcn.h>
 #import <CoreGraphics/CoreGraphics.h>
 #include "window_registry.h"
+#import <sys/time.h>
+#import <pthread.h>
 
 // Declare NSWindow private methods
 @interface NSWindow (PrivateMethods)
@@ -70,6 +72,35 @@ typedef enum {
     PROCESS_ROLE_UTILITY     // Background service process
 } process_role_t;
 
+// Window classification by CGS properties
+typedef enum {
+    WINDOW_CLASS_UNKNOWN = 0,
+    WINDOW_CLASS_STANDARD,      // Standard application window
+    WINDOW_CLASS_PANEL,         // Panel/utility window
+    WINDOW_CLASS_SHEET,         // Sheet dialog
+    WINDOW_CLASS_SYSTEM,        // System window
+    WINDOW_CLASS_HELPER         // Helper/auxiliary window
+} window_class_t;
+
+// Window state tracking structure
+typedef struct {
+    uint32_t window_id;
+    uint32_t window_state;      // Bitfield of events received
+    bool is_initialized;        // Window fully initialized flag
+    time_t first_seen;          // Timestamp when window was first seen
+    window_class_t window_class; // Classification of window
+} window_init_state_t;
+
+// Window state flags
+#define WINDOW_STATE_CREATED         (1 << 0)
+#define WINDOW_STATE_VISIBLE         (1 << 1)
+#define WINDOW_STATE_SIZED           (1 << 2)
+#define WINDOW_STATE_CONTENT_READY   (1 << 3)
+#define WINDOW_STATE_FULLY_INITIALIZED (WINDOW_STATE_CREATED | \
+                                       WINDOW_STATE_VISIBLE | \
+                                       WINDOW_STATE_SIZED | \
+                                       WINDOW_STATE_CONTENT_READY)
+
 // Window stability tracking
 typedef struct {
     CGSWindowID windowID;
@@ -92,6 +123,25 @@ static int retry_window_count = 0;
 static double retry_delays[] = {0.1, 0.3, 0.6, 1.0, 2.0}; // Progressive delays in seconds
 static const int max_retry_attempts = 5;
 
+// Thread-local storage for current window context
+static pthread_key_t current_window_key;
+static bool thread_keys_initialized = false;
+
+// Window state tracking dictionary (window ID -> state)
+static CFMutableDictionaryRef window_states = NULL;
+
+// Application initialization state tracking
+typedef enum {
+    APP_INIT_NOT_STARTED,
+    APP_INIT_FIRST_WINDOW_CREATING,
+    APP_INIT_FIRST_WINDOW_COMPLETE,
+    APP_INIT_MAIN_WINDOW_CREATING,
+    APP_INIT_COMPLETE
+} app_init_state_t;
+
+static app_init_state_t current_init_state = APP_INIT_NOT_STARTED;
+static int main_window_count = 0;
+
 // Forward declarations
 static NSDictionary *getWindowInfoWithCGS(CGSWindowID windowID);
 static bool modifyWindowWithCGS(CGSWindowID windowID);
@@ -102,9 +152,31 @@ static void restoreFrontmostApp(void);
 static bool isUtilityWindow(CGSWindowID windowID);
 static bool isWindowReadyForModification(CGSWindowID windowID);
 static bool isInStartupProtection(void);
+static bool isApplicationInitialized(void);
 static bool modifyWindowWithCGSInternal(CGSWindowID windowID, bool isRetry);
 static void addWindowToRetryQueue(CGSWindowID windowID);
 static void processRetryQueue(void);
+static window_class_t determineWindowClass(CGSWindowID windowID, NSDictionary *windowInfo);
+static bool isWindowInitialized(CGSWindowID windowID);
+static void updateInitializationState(int eventType, CGSWindowID windowID);
+
+// Function to count initialized standard windows for the dictionary applier
+static void countInitializedStandardWindows(const void *key, const void *value, void *context) {
+    window_init_state_t *state = (window_init_state_t *)value;
+    if (state->window_class == WINDOW_CLASS_STANDARD && state->is_initialized) {
+        int *counter = (int *)context;
+        (*counter)++;
+    }
+}
+
+// Function to count all standard windows (initialized or not)
+static void countStandardWindows(const void *key, const void *value, void *context) {
+    window_init_state_t *state = (window_init_state_t *)value;
+    if (state->window_class == WINDOW_CLASS_STANDARD) {
+        int *counter = (int *)context;
+        (*counter)++;
+    }
+}
 
 // Save previous app
 static void saveFrontmostApp(void) {
@@ -190,6 +262,243 @@ static NSDictionary *getWindowInfoWithCGS(CGSWindowID windowID) {
     return CFBridgingRelease((__bridge_retained CFTypeRef)windowInfo);
 }
 
+// Determine window class from CGS properties
+static window_class_t determineWindowClass(CGSWindowID windowID, NSDictionary *windowInfo) {
+    if (!windowInfo) {
+        return WINDOW_CLASS_UNKNOWN;
+    }
+    
+    // Extract window metadata
+    NSNumber *alpha = windowInfo[@"kCGSWindowAlpha"];
+    NSNumber *width = windowInfo[@"kCGSWindowWidth"];
+    NSNumber *height = windowInfo[@"kCGSWindowHeight"];
+    NSString *windowLayer = windowInfo[@"kCGSWindowLayer"];
+    NSNumber *windowLevel = windowInfo[@"kCGSWindowLevel"];
+    NSNumber *styleMask = windowInfo[@"kCGSWindowStyleMask"];
+    
+    // Non-standard window levels indicate system or panel windows
+    if (windowLevel) {
+        int level = [windowLevel intValue];
+        if (level > 0) {
+            return (level > 3) ? WINDOW_CLASS_SYSTEM : WINDOW_CLASS_PANEL;
+        }
+    }
+    
+    // Layer detection (non-zero layers are usually utility windows)
+    if (windowLayer && [windowLayer intValue] != 0) {
+        return WINDOW_CLASS_HELPER;
+    }
+    
+    // Size detection (very small windows are helper/utility windows)
+    if (width && height) {
+        if ([width intValue] < 100 || [height intValue] < 100) {
+            return WINDOW_CLASS_HELPER;
+        }
+    }
+    
+    // Visibility detection (invisible or nearly invisible windows)
+    if (alpha && [alpha doubleValue] < 0.3) {
+        return WINDOW_CLASS_HELPER;
+    }
+    
+    // Use style mask bits for classification if available
+    if (styleMask) {
+        uint32_t style = [styleMask unsignedIntValue];
+        
+        // Check for utility window style
+        if (style & 0x8) {  // NSWindowStyleMaskUtilityWindow equivalent
+            return WINDOW_CLASS_PANEL;
+        }
+        
+        // Check for sheet style
+        if (style & 0x200) { // NSWindowStyleMaskSheet equivalent
+            return WINDOW_CLASS_SHEET;
+        }
+        
+        // Standard window with title bar
+        if (style & 0x1) {  // NSWindowStyleMaskTitled equivalent
+            return WINDOW_CLASS_STANDARD;
+        }
+    }
+    
+    // Default to standard if it passes basic size/visibility tests
+    if ((width && [width intValue] >= 100) && 
+        (height && [height intValue] >= 100) && 
+        (alpha && [alpha doubleValue] >= 0.3)) {
+        return WINDOW_CLASS_STANDARD;
+    }
+    
+    // When in doubt, treat as helper window
+    return WINDOW_CLASS_HELPER;
+}
+
+// Check if a window is fully initialized
+static bool isWindowInitialized(CGSWindowID windowID) {
+    if (!window_states) {
+        return false;
+    }
+    
+    NSNumber *key = @(windowID);
+    if (!CFDictionaryContainsKey(window_states, (__bridge CFNumberRef)key)) {
+        return false;
+    }
+    
+    window_init_state_t *state = (window_init_state_t *)CFDictionaryGetValue(
+        window_states, (__bridge CFNumberRef)key);
+    
+    return state->is_initialized;
+}
+
+// Update application initialization state based on window events - Phase 4 implementation with complete state machine
+static void updateInitializationState(int eventType, CGSWindowID windowID) {
+    // Get window info and class
+    NSDictionary *windowInfo = getWindowInfoWithCGS(windowID);
+    window_class_t windowClass = determineWindowClass(windowID, windowInfo);
+    
+    // For phase 4, we're adding tracking of important windows - store the window ID for later reference
+    static CGSWindowID mainWindowID = 0;
+    static NSMutableArray *standardWindowIDs = nil;
+    
+    // Initialize the array if needed
+    if (!standardWindowIDs) {
+        standardWindowIDs = [[NSMutableArray alloc] init];
+    }
+    
+    // Check if this is a standard window and add it to our tracking if not already there
+    if (windowClass == WINDOW_CLASS_STANDARD && 
+        ![standardWindowIDs containsObject:@(windowID)]) {
+        [standardWindowIDs addObject:@(windowID)];
+        printf("[Modifier] Added standard window %d to tracking (total: %lu)\n", 
+              windowID, (unsigned long)[standardWindowIDs count]);
+    }
+    
+    // Update state machine based on current state, event, and window properties
+    switch (current_init_state) {
+        case APP_INIT_NOT_STARTED:
+            // Any window event moves us to the first state
+            current_init_state = APP_INIT_FIRST_WINDOW_CREATING;
+            printf("[Modifier] App initialization started (first window event detected)\n");
+            break;
+            
+        case APP_INIT_FIRST_WINDOW_CREATING:
+            // When we see a standard window that's fully initialized, consider first window complete
+            if (windowClass == WINDOW_CLASS_STANDARD) {
+                bool initialized = isWindowInitialized(windowID);
+                
+                // Enhanced logging
+                printf("[Modifier] Standard window %d detected during initial phase (initialized: %s)\n", 
+                       windowID, initialized ? "yes" : "no");
+                
+                if (initialized) {
+                    // Count all initialized standard windows
+                    main_window_count = 0;
+                    for (NSNumber *winIDObj in standardWindowIDs) {
+                        CGSWindowID trackedWinID = [winIDObj unsignedIntValue];
+                        if (isWindowInitialized(trackedWinID)) {
+                            main_window_count++;
+                        }
+                    }
+                    
+                    // Now we have at least one initialized window
+                    current_init_state = APP_INIT_FIRST_WINDOW_COMPLETE;
+                    printf("[Modifier] First window phase complete (initialized standard windows: %d)\n", 
+                           main_window_count);
+                }
+            }
+            break;
+            
+        case APP_INIT_FIRST_WINDOW_COMPLETE:
+            // For a more robust approach, we'll detect the main application window based
+            // on events and properties, rather than just looking for the next window
+            
+            // If we see a large standard window being created/becoming visible, it's likely the main window
+            if ((eventType == kCGSWindowDidCreateNotification || 
+                 eventType == kCGSWindowDidOrderInNotification) && 
+                windowClass == WINDOW_CLASS_STANDARD) {
+                
+                // Get size information - main window is typically larger
+                NSNumber *width = windowInfo[@"kCGSWindowWidth"];
+                NSNumber *height = windowInfo[@"kCGSWindowHeight"];
+                
+                // Check if this looks like a main window (substantial size)
+                if (width && height && 
+                    [width intValue] >= 400 && [height intValue] >= 300) {
+                    
+                    mainWindowID = windowID;
+                    current_init_state = APP_INIT_MAIN_WINDOW_CREATING;
+                    printf("[Modifier] Potential main window (%d) detected (%d x %d)\n", 
+                          windowID, [width intValue], [height intValue]);
+                }
+            }
+            break;
+            
+        case APP_INIT_MAIN_WINDOW_CREATING:
+            // The main window is considered ready when it's updated, has content, and is initialized
+            
+            // Track updates to the main window we identified
+            if (windowID == mainWindowID) {
+                // General update events are a good sign the window is getting ready
+                if (eventType == kCGSWindowDidUpdateNotification || 
+                    eventType == kCGSWindowDidResizeNotification) {
+                    
+                    // Check if it's fully initialized
+                    if (isWindowInitialized(windowID)) {
+                        current_init_state = APP_INIT_COMPLETE;
+                        printf("[Modifier] Application fully initialized (main window ready)\n");
+                    } else {
+                        printf("[Modifier] Main window progressing but not yet fully initialized\n");
+                    }
+                }
+            }
+            
+            // If we have multiple initialized standard windows, that's also a good
+            // indication the app is ready even if we haven't positively ID'd the main window
+            if (main_window_count >= 2) {
+                current_init_state = APP_INIT_COMPLETE;
+                printf("[Modifier] Application considered initialized (multiple standard windows ready)\n");
+            }
+            break;
+            
+        case APP_INIT_COMPLETE:
+            // No state changes needed, but we'll continue tracking windows
+            
+            // For diagnostics, count initialized windows periodically
+            static time_t last_count_time = 0;
+            time_t now = time(NULL);
+            
+            if (now - last_count_time >= 5) { // Every 5 seconds
+                main_window_count = 0;
+                for (NSNumber *winIDObj in standardWindowIDs) {
+                    CGSWindowID trackedWinID = [winIDObj unsignedIntValue];
+                    if (isWindowInitialized(trackedWinID)) {
+                        main_window_count++;
+                    }
+                }
+                
+                printf("[Modifier] Application status: %d initialized standard windows\n", main_window_count);
+                last_count_time = now;
+            }
+            break;
+    }
+    
+    // Clean up closed or invalid windows from our tracking array
+    NSMutableIndexSet *indicesToRemove = [NSMutableIndexSet indexSet];
+    [standardWindowIDs enumerateObjectsUsingBlock:^(NSNumber *winIDObj, NSUInteger idx, BOOL *stop) {
+        CGSWindowID trackedWinID = [winIDObj unsignedIntValue];
+        
+        // If we can't get window info, it's likely gone
+        if (!getWindowInfoWithCGS(trackedWinID)) {
+            [indicesToRemove addIndex:idx];
+            printf("[Modifier] Removing window %d from tracking (no longer exists)\n", trackedWinID);
+        }
+    }];
+    
+    // Remove all marked indices
+    if ([indicesToRemove count] > 0) {
+        [standardWindowIDs removeObjectsAtIndexes:indicesToRemove];
+    }
+}
+
 // Check if a window is ready for modification
 static bool isWindowReadyForModification(CGSWindowID windowID) {
     if (!CGSDefaultConnection_ptr || !CGSCopyWindowDescriptionList_ptr) {
@@ -258,8 +567,34 @@ static process_role_t detectProcessRole(void) {
     return PROCESS_ROLE_MAIN; // Default
 }
 
-// Check if a window belongs to a utility process
+// Check if a window should be treated as a utility window (not a main application window)
 static bool isUtilityWindow(CGSWindowID windowID) {
+    // First, check if we have this window in our tracking system
+    if (window_states) {
+        NSNumber *key = @(windowID);
+        if (CFDictionaryContainsKey(window_states, (__bridge CFNumberRef)key)) {
+            window_init_state_t *state = (window_init_state_t *)CFDictionaryGetValue(
+                window_states, (__bridge CFNumberRef)key);
+            
+            // Use the window classification to determine if it's a utility window
+            switch (state->window_class) {
+                case WINDOW_CLASS_PANEL:
+                case WINDOW_CLASS_SHEET:
+                case WINDOW_CLASS_SYSTEM:
+                case WINDOW_CLASS_HELPER:
+                    return true;
+                    
+                case WINDOW_CLASS_STANDARD:
+                    return false;
+                    
+                case WINDOW_CLASS_UNKNOWN:
+                    // Fall through to legacy checks for unknown classification
+                    break;
+            }
+        }
+    }
+    
+    // Fall back to legacy property-based detection if not tracked or unknown class
     NSDictionary *windowInfo = getWindowInfoWithCGS(windowID);
     if (!windowInfo) {
         return false;
@@ -271,509 +606,61 @@ static bool isUtilityWindow(CGSWindowID windowID) {
     NSNumber *height = windowInfo[@"kCGSWindowHeight"];
     NSString *windowLayer = windowInfo[@"kCGSWindowLayer"];
     
-    // Layer detection
-    if (windowLayer && [windowLayer intValue] != 0) {
-        return true;
-    }
-    
-    // Size detection
-    if ([width intValue] < 100 || [height intValue] < 100) {
-        return true;
-    }
-    
-    // Visibility detection
-    if ([alpha doubleValue] < 0.3) {
+    // Visibility, size, and layer checks (same logic as window classification)
+    if ((windowLayer && [windowLayer intValue] != 0) ||
+        ([width intValue] < 100 || [height intValue] < 100) ||
+        ([alpha doubleValue] < 0.3)) {
         return true;
     }
     
     return false;
 }
 
-// Check if we're in startup protection period
-static bool isInStartupProtection(void) {
-    // Utility processes are always protected
-    if (current_process_role == PROCESS_ROLE_UTILITY) {
+// Check if the application is fully initialized - Phase 4 implementation prioritizing window state
+static bool isApplicationInitialized(void) {
+    // Get current time for timeout calculations
+    time_t now = time(NULL);
+    
+    // Phase 4: Multi-layered approach to initialization detection
+    
+    // Layer 1: State machine - most accurate when working correctly
+    if (current_init_state >= APP_INIT_FIRST_WINDOW_COMPLETE) {
         return true;
     }
     
-    // UI process protection
-    if (current_process_role == PROCESS_ROLE_UI) {
-        // Protect first few windows
-        if (modified_window_count < MAX_PROTECTED_WINDOWS) {
+    // Layer 2: Window count heuristic - apps with multiple standard windows are likely initialized
+    int standard_window_count = 0;
+    int initialized_window_count = 0;
+    
+    if (window_states) {
+        // Count standard and initialized windows
+        CFDictionaryApplyFunction(window_states, countInitializedStandardWindows, &initialized_window_count);
+        
+        // Count all standard windows (initialized or not)
+        CFDictionaryApplyFunction(window_states, countStandardWindows, &standard_window_count);
+        
+        // Update global counter for other functions to use
+        main_window_count = initialized_window_count;
+        
+        // Heuristic based on window counts
+        if (initialized_window_count >= 1) {
+            // We have at least one fully initialized standard window
+            printf("[Modifier] App considered initialized: %d initialized standard window(s)\n", 
+                  initialized_window_count);
+                  
+            // Update state machine to match reality
+            if (current_init_state < APP_INIT_FIRST_WINDOW_COMPLETE) {
+                current_init_state = APP_INIT_FIRST_WINDOW_COMPLETE;
+            }
+            
             return true;
         }
         
-        // Time-based protection
-        time_t now = time(NULL);
-        if (now - process_start_time < UI_STARTUP_PROTECTION_SECONDS) {
-            return true;
-        }
-    } else {
-        // Standard protection for main process
-        time_t now = time(NULL);
-        if (now - process_start_time < STARTUP_PROTECTION_SECONDS) {
-            return true;
-        }
-    }
-    
-    return false;
-}
-
-// Internal implementation of window modification
-static bool modifyWindowWithCGSInternal(CGSWindowID windowID, bool isRetry) {
-    if (!CGSDefaultConnection_ptr || windowID == 0) return false;
-    
-    // Check if already modified
-    if (window_registry && registry_is_window_modified(window_registry, windowID)) {
-        if (!isRetry) {
-            printf("[Modifier] Window %d already modified, skipping\n", windowID);
-        }
-        return true;
-    }
-    
-    CGSConnectionID cid = CGSDefaultConnection_ptr();
-    bool success = true;
-    
-    // Error handling wrapper
-    @try {
-        // 1. Apply non-activating (prevent stealing focus)
-        if (CGSSetWindowTags_ptr) {
-            int tags[1] = { kCGSPreventsActivationTagBit };
-            CGError err = CGSSetWindowTags_ptr(cid, windowID, tags, 1);
-            
-            if (err != 0) {
-                printf("[Modifier] Warning: Failed to set non-activating for window %d\n", windowID);
-                success = false;
-            }
-        }
-        
-        // 2. Always-on-top (floating window level)
-        if (CGSSetWindowLevel_ptr) {
-            CGError err = CGSSetWindowLevel_ptr(cid, windowID, kCGSWindowLevelForKey);
-            
-            if (err != 0) {
-                printf("[Modifier] Warning: Failed to set window level for window %d\n", windowID);
-                success = false;
-            }
-        }
-        
-        // 3. Screen capture bypass
-        if (CGSSetWindowSharingState_ptr) {
-            CGError err = CGSSetWindowSharingState_ptr(cid, windowID, kCGSWindowSharingNoneValue);
-            
-            if (err != 0) {
-                printf("[Modifier] Warning: Failed to set screen capture bypass for window %d\n", windowID);
-                success = false;
-            }
-        }
-    }
-    @catch (NSException *exception) {
-        printf("[Modifier] Exception during window modification\n");
-        success = false;
-    }
-    
-    if (success && window_registry) {
-        // Mark the window as modified
-        registry_mark_window_modified(window_registry, windowID);
-        modified_window_count++;
-    }
-    
-    return success;
-}
-
-// Apply window modifications directly using CGS APIs
-// Add a window to the retry queue
-static void addWindowToRetryQueue(CGSWindowID windowID) {
-    // Check if window is already in the queue
-    for (int i = 0; i < retry_window_count; i++) {
-        if (retry_windows[i].windowID == windowID) {
-            // Already in queue, update next attempt time
-            retry_windows[i].attempts++;
-            
-            if (retry_windows[i].attempts < max_retry_attempts) {
-                int delayIndex = retry_windows[i].attempts < 5 ? retry_windows[i].attempts : 4;
-                double delayTime = retry_delays[delayIndex];
-                
-                struct timeval tv;
-                gettimeofday(&tv, NULL);
-                double currentTime = tv.tv_sec + (tv.tv_usec / 1000000.0);
-                
-                retry_windows[i].next_attempt_time = currentTime + delayTime;
-                
-                printf("[Modifier] Window %d scheduled for retry %d in %.1f seconds\n", 
-                       windowID, retry_windows[i].attempts, delayTime);
-            } else {
-                printf("[Modifier] Window %d max retries reached, abandoning\n", windowID);
-                
-                // Remove from queue by swapping with last entry
-                retry_windows[i] = retry_windows[retry_window_count - 1];
-                retry_window_count--;
-            }
-            return;
-        }
-    }
-    
-    // Add new entry if we have space
-    if (retry_window_count < 32) {
-        retry_windows[retry_window_count].windowID = windowID;
-        retry_windows[retry_window_count].attempts = 0;
-        
-        struct timeval tv;
-        gettimeofday(&tv, NULL);
-        double currentTime = tv.tv_sec + (tv.tv_usec / 1000000.0);
-        
-        retry_windows[retry_window_count].next_attempt_time = currentTime + retry_delays[0];
-        
-        printf("[Modifier] Window %d added to retry queue (will retry in %.1f seconds)\n", 
-               windowID, retry_delays[0]);
-        
-        retry_window_count++;
-    }
-}
-
-// Process the retry queue
-static void processRetryQueue(void) {
-    if (retry_window_count == 0) {
-        return;
-    }
-    
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    double currentTime = tv.tv_sec + (tv.tv_usec / 1000000.0);
-    
-    // Process the queue from the end to make removals easier
-    for (int i = retry_window_count - 1; i >= 0; i--) {
-        if (currentTime >= retry_windows[i].next_attempt_time) {
-            CGSWindowID windowID = retry_windows[i].windowID;
-            
-            // Check if the window is ready and if so, try to modify it
-            if (isWindowReadyForModification(windowID)) {
-                if (modifyWindowWithCGSInternal(windowID, true)) {
-                    // Success! Remove from queue
-                    retry_windows[i] = retry_windows[retry_window_count - 1];
-                    retry_window_count--;
-                    printf("[Modifier] Successfully modified window %d on retry\n", windowID);
-                } else {
-                    // Failed again, update for next retry
-                    retry_windows[i].attempts++;
-                    
-                    if (retry_windows[i].attempts < max_retry_attempts) {
-                        int delayIndex = retry_windows[i].attempts < 5 ? retry_windows[i].attempts : 4;
-                        retry_windows[i].next_attempt_time = currentTime + retry_delays[delayIndex];
-                    } else {
-                        // Max retries reached, remove from queue
-                        retry_windows[i] = retry_windows[retry_window_count - 1];
-                        retry_window_count--;
-                    }
-                }
-            } else {
-                // Window not ready yet, schedule next attempt
-                retry_windows[i].next_attempt_time = currentTime + retry_delays[0];
-            }
-        }
-    }
-}
-
-static bool modifyWindowWithCGS(CGSWindowID windowID) {
-    // Skip if in startup protection
-    if (isInStartupProtection()) {
-        printf("[Modifier] Window %d skipped - in startup protection period\n", windowID);
-        // For main process windows during startup, add to retry queue to try later
-        if (current_process_role != PROCESS_ROLE_UTILITY) {
-            addWindowToRetryQueue(windowID);
-        }
-        return false;
-    }
-    
-    // Skip utility windows
-    if (isUtilityWindow(windowID)) {
-        printf("[Modifier] Window %d skipped - detected as utility window\n", windowID);
-        return false;
-    }
-    
-    // First check if window is ready for modification
-    if (!isWindowReadyForModification(windowID)) {
-        printf("[Modifier] Window %d not ready for modification, adding to retry queue\n", windowID);
-        addWindowToRetryQueue(windowID);
-        return false;
-    }
-    
-    // Try to modify the window
-    bool success = modifyWindowWithCGSInternal(windowID, false);
-    
-    // If modification failed, add to retry queue
-    if (!success) {
-        printf("[Modifier] Window %d modification failed, adding to retry queue\n", windowID);
-        addWindowToRetryQueue(windowID);
-    }
-    
-    return success;
-}
-
-// Apply modifications to an NSWindow
-static bool modifyNSWindow(NSWindow *window) {
-    if (!window) return false;
-    
-    CGSWindowID windowID = (CGSWindowID)[window windowNumber];
-    
-    // Skip if already modified
-    if (window_registry && registry_is_window_modified(window_registry, windowID)) {
-        return true;
-    }
-    
-    // Apply modifications with error handling
-    @try {
-        // 1. Non-activating behavior
-        if ([window respondsToSelector:@selector(_setPreventsActivation:)]) {
-            [window _setPreventsActivation:YES];
-        }
-        
-        // 2. Always-on-top behavior
-        window.level = NSFloatingWindowLevel;
-        
-        // 3. Screen capture bypass
-        window.sharingType = NSWindowSharingNone;
-        
-        // 4. Mission control compatibility - added NSWindowCollectionBehaviorManaged
-        window.collectionBehavior =  NSWindowCollectionBehaviorParticipatesInCycle |
-                                   NSWindowCollectionBehaviorManaged;
-    }
-    @catch (NSException *exception) {
-        return false;
-    }
-    
-    // Mark as modified
-    if (window_registry) {
-        registry_mark_window_modified(window_registry, windowID);
-        modified_window_count++;
-    }
-    
-    return true;
-}
-
-// CGS Window Notification callback
-static void cgsWindowNotificationCallback(int type, void *data, uint32_t data_length, void *arg) {
-    if (!data || data_length < sizeof(CGSWindowID)) {
-        return;
-    }
-    
-    CGSWindowID windowID = *(CGSWindowID *)data;
-    
-    if (type == kCGSWindowDidCreateNotification || type == kCGSWindowDidOrderInNotification) {
-        // Try to modify this window
-        modifyWindowWithCGS(windowID);
-    }
-}
-
-// Set up CGS window notification monitoring
-static bool setupCGSWindowMonitoring(void) {
-    if (!CGSRegisterNotifyProc_ptr) {
-        return false;
-    }
-    
-    if (is_cgs_monitor_active) {
-        return true;
-    }
-    
-    // Try to register for notifications
-    CGSRegisterNotifyProc_ptr(cgsWindowNotificationCallback, kCGSWindowDidCreateNotification, NULL);
-    CGSRegisterNotifyProc_ptr(cgsWindowNotificationCallback, kCGSWindowDidOrderInNotification, NULL);
-    
-    is_cgs_monitor_active = true;
-    
-    return true;
-}
-
-// Scan for existing windows using CGS
-static void scanExistingWindowsWithCGS(void) {
-    if (!CGSGetOnScreenWindowList_ptr || !CGSDefaultConnection_ptr) {
-        return;
-    }
-    
-    CGSConnectionID cid = CGSDefaultConnection_ptr();
-    const int maxWindows = 256;
-    CGSWindowID windowList[maxWindows];
-    int windowCount = 0;
-    
-    CGError err = CGSGetOnScreenWindowList_ptr(cid, cid, maxWindows, windowList, &windowCount);
-    
-    if (err != 0) {
-        return;
-    }
-    
-    printf("[Modifier] Found %d windows via CGS\n", windowCount);
-    
-    for (int i = 0; i < windowCount; i++) {
-        modifyWindowWithCGS(windowList[i]);
-    }
-}
-
-// Apply modifications to all NSWindows
-static bool applyAllWindowModifications(void) {
-    saveFrontmostApp();
-    
-    // First, try to modify via AppKit if available
-    if (NSApp) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            // Apply to each window
-            for (NSWindow *window in [NSApp windows]) {
-                modifyNSWindow(window);
-            }
-            
-            // Return focus
-            restoreFrontmostApp();
-        });
-    }
-    
-    // Also scan for windows using CGS
-    scanExistingWindowsWithCGS();
-    
-    return true;
-}
-
-// Method swizzling for window creation detection
-static void setupWindowMethodSwizzling(void) {
-    Class windowClass = [NSWindow class];
-    
-    // Methods to swizzle
-    SEL selectors[] = {
-        @selector(orderFront:),
-        @selector(makeKeyAndOrderFront:)
-    };
-    
-    // Selector names for debugging - this is not used in code but kept for reference
-    __attribute__((unused)) const char *selectorNames[] = {
-        "orderFront:",
-        "makeKeyAndOrderFront:"
-    };
-    
-    for (int i = 0; i < 2; i++) {
-        Method method = class_getInstanceMethod(windowClass, selectors[i]);
-        
-        if (!method) {
-            continue;
-        }
-        
-        // Get original implementation
-        IMP originalImp = method_getImplementation(method);
-        SEL currentSelector = selectors[i];
-        
-        // Create new implementation
-        IMP newImp = imp_implementationWithBlock(^(id self, id sender) {
-            // Call original method
-            ((void (*)(id, SEL, id))originalImp)(self, currentSelector, sender);
-            
-            // Now modify the window
-            modifyNSWindow((NSWindow *)self);
-        });
-        
-        // Replace method implementation
-        method_setImplementation(method, newImp);
-    }
-}
-
-// Setup window notification observer
-static void setupWindowObserver(void) {
-    [[NSNotificationCenter defaultCenter] 
-        addObserverForName:NSWindowDidBecomeKeyNotification 
-                    object:nil 
-                     queue:[NSOperationQueue mainQueue] 
-                usingBlock:^(NSNotification *note) {
-        NSWindow *window = note.object;
-        if (window) {
-            modifyNSWindow(window);
-        }
-    }];
-    
-    printf("[Modifier] Window observer set up successfully\n");
-}
-
-// Initialize the window modifier system
-static bool initWindowModifier(void) {
-    printf("[Modifier] Initializing window modifier system...\n");
-    
-    // Record process start time for startup protection
-    process_start_time = time(NULL);
-    
-    // Detect process role
-    current_process_role = detectProcessRole();
-    
-    // Initialize registry
-    window_registry = registry_init();
-    
-    // Load CGS functions
-    loadCGSFunctions();
-    
-    // Set up CGS window monitoring
-    setupCGSWindowMonitoring();
-    
-    // Save frontmost app for focus restoration
-    saveFrontmostApp();
-    
-    // Set up AppKit-based window detection
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (NSApp) {
-            // Set up swizzling for window creation methods
-            setupWindowMethodSwizzling();
-            
-            // Set up notification observers
-            setupWindowObserver();
-            
-            // Temporarily set app to regular mode for Mission Control display
-            if ([NSApp respondsToSelector:@selector(setActivationPolicy:)]) {
-                [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
-            }
-            
-            // Apply window modification with a small delay
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), 
-                           dispatch_get_main_queue(), ^{
-                applyAllWindowModifications();
-                
-                // Return to accessory app mode
-                if ([NSApp respondsToSelector:@selector(setActivationPolicy:)]) {
-                    [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
-                    printf("[Modifier] Application set to accessory mode\n");
-                }
-            });
-        } else {
-            printf("[Modifier] NSApp not available, using CGS-only approach\n");
-            // If NSApp is not available, this is likely a non-AppKit process
-            // Apply initial CGS scan
-            scanExistingWindowsWithCGS();
-        }
-    });
-    
-    return true;
-}
-
-// Main Entry Point
-void* window_modifier_main(void* arg) {
-    printf("[Modifier] Window modifier starting up...\n");
-    printf("[Modifier] Process ID: %d\n", getpid());
-    
-    initWindowModifier();
-    
-    // Wait a bit for initial setup
-    sleep(1);
-    
-    // Main monitoring loop with retry queue processing
-    while (1) {
-        // Wait less time when we have pending windows
-        if (retry_window_count > 0) {
-            // Check more frequently when we have windows in retry queue
-            usleep(500000); // 0.5 seconds
-        } else {
-            sleep(2); // Standard interval
-        }
-        
-        // Process any windows in the retry queue that are ready
-        if (retry_window_count > 0) {
-            processRetryQueue();
-        }
-        
-        // Periodically scan for new windows
-        applyAllWindowModifications();
-    }
-    
-    return NULL;
-}
+        if (standard_window_count >= 3) {
+            // Multiple standard windows usually indicate the app is up and running
+            printf("[Modifier] App considered initialized: multiple standard windows detected (%d)\n", 
+                  standard_window_count);
+                  
+            // Update state machine to match reality
+            if (current_init_state < APP_INIT_FIRST_WINDOW_COMPLETE) {
+                current_init_state = APP_INIT_FIRST_WINDOW_COMPLETE;
