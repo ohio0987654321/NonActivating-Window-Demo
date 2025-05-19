@@ -23,8 +23,7 @@ static process_role_t current_process_role = PROCESS_ROLE_MAIN;
 static time_t process_start_time = 0;
 static int modified_window_count = 0;
 // Application startup detection and protection times (for all macOS applications)
-static const int STARTUP_PROTECTION_SECONDS = 1; // Reduced protection period
-static const int UI_STARTUP_PROTECTION_SECONDS = 2; // Reduced protection for UI processes
+static const int STARTUP_PROTECTION_SECONDS = 0; // Reduced protection period
 static const int MAX_PROTECTED_WINDOWS = 2; // Limit for protected windows
 static retry_window_t retry_windows[32];
 static int retry_window_count = 0;
@@ -97,15 +96,13 @@ static void restoreFrontmostApp(void) {
 // Check if we're in the startup protection period
 bool isInStartupProtection(void) {
     time_t now = time(NULL);
-    int protection_period = (current_process_role == PROCESS_ROLE_UI) ? 
-                            UI_STARTUP_PROTECTION_SECONDS : STARTUP_PROTECTION_SECONDS;
     
     if (process_start_time == 0) {
         process_start_time = now; // Initialize if not set
     }
     
     // Are we within the protection time and under the protected window limit?
-    return ((now - process_start_time < protection_period) && 
+    return ((now - process_start_time < STARTUP_PROTECTION_SECONDS) && 
             (modified_window_count < MAX_PROTECTED_WINDOWS));
 }
 

@@ -67,32 +67,5 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.m | $(BUILD_DIRS)
 clean:
 	rm -rf $(BUILD_DIR)
 
-# Use the injector to run the modifier on applications
-run-discord: all
-	$(INJECTOR) /Applications/Discord.app
 
-run-slack: all
-	$(INJECTOR) /Applications/Slack.app
-
-run-chrome: all
-	$(INJECTOR) "/Applications/Google Chrome.app"
-
-run-safari: all
-	$(INJECTOR) /Applications/Safari.app
-
-run-firefox: all
-	$(INJECTOR) /Applications/Firefox.app
-
-run-terminal: all
-	$(INJECTOR) /System/Applications/Utilities/Terminal.app
-
-# General run target
-run: all
-	@echo "Usage: make run-app APP=/path/to/application.app"
-	@exit 1
-
-run-app: all
-	@[ -n "$(APP)" ] || (echo "Error: Please specify APP=/path/to/application.app" && exit 1)
-	$(INJECTOR) "$(APP)"
-
-.PHONY: all clean run run-app run-discord run-slack run-chrome run-safari run-firefox run-terminal
+.PHONY: all clean
