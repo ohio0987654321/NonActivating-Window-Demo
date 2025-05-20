@@ -59,7 +59,7 @@ static bool modifyWindowWithNSWindow(CGSWindowID windowID);
 static void modifyWindowWhenSafe(CGSWindowID windowID);
 
 // Function to count initialized standard windows for the dictionary applier
-static void countInitializedStandardWindows(const void *key, const void *value, void *context) {
+static void countInitializedStandardWindows(const void * __attribute__((unused)) key, const void *value, void *context) {
     window_init_state_t *state = (window_init_state_t *)value;
     if (state->window_class == WINDOW_CLASS_STANDARD && state->is_initialized) {
         int *counter = (int *)context;
@@ -68,7 +68,7 @@ static void countInitializedStandardWindows(const void *key, const void *value, 
 }
 
 // Function to count all standard windows (initialized or not)
-static void countStandardWindows(const void *key, const void *value, void *context) {
+static void countStandardWindows(const void * __attribute__((unused)) key, const void *value, void *context) {
     window_init_state_t *state = (window_init_state_t *)value;
     if (state->window_class == WINDOW_CLASS_STANDARD) {
         int *counter = (int *)context;
@@ -77,7 +77,7 @@ static void countStandardWindows(const void *key, const void *value, void *conte
 }
 
 // Save previous app
-static void saveFrontmostApp(void) {
+static void __attribute__((unused)) saveFrontmostApp(void) {
     NSRunningApplication *frontApp = [[NSWorkspace sharedWorkspace] frontmostApplication];
     if (frontApp && ![frontApp.bundleIdentifier isEqualToString:[[NSBundle mainBundle] bundleIdentifier]]) {
         previousFrontmostApp = frontApp;
@@ -86,7 +86,7 @@ static void saveFrontmostApp(void) {
 }
 
 // Return focus to previous app
-static void restoreFrontmostApp(void) {
+static void __attribute__((unused)) restoreFrontmostApp(void) {
     if (previousFrontmostApp) {
         [previousFrontmostApp activateWithOptions:0];
         printf("[Modifier] Restored focus to: %s\n", [previousFrontmostApp.localizedName UTF8String]);
@@ -158,11 +158,14 @@ static bool modifyWindowWithCGSInternal(CGSWindowID windowID, bool isRetry) {
                    windowID, ownerCID, cid);
             
             // Special case: Owner ID 0 indicates a system window or special permission window
-            // These windows require special handling to avoid crashes
+            // These windows should be completely avoided to prevent crashes
             if (ownerCID == 0) {
-                printf("[Modifier] Window %d has special ownership (ID 0), using safer approach\n", windowID);
-                // For owner ID 0, we'll only attempt to modify window level, which is safer
-                // and skip the more problematic window tag operations
+                printf("[Modifier] Window %d has special ownership (ID 0), avoiding modification\n", windowID);
+                // Mark as modified in registry to avoid future attempts
+                if (window_registry) {
+                    registry_mark_window_modified(window_registry, windowID);
+                }
+                return false; // Skip this window completely
             }
         }
     }
@@ -233,26 +236,8 @@ static bool modifyWindowWithCGSInternal(CGSWindowID windowID, bool isRetry) {
     // Add prevents-activation tag - only for windows that don't have owner ID 0
     int tag = kCGSPreventsActivationTagBit;
     
-    // For windows with Owner ID 0, try to use NSWindow approach first
-    if (ownerCID == 0) {
-        printf("[Modifier] Window %d has owner ID 0, attempting NSWindow approach\n", windowID);
-        
-        // Try to find and modify the NSWindow
-        bool nswindowSuccess = modifyWindowWithNSWindow(windowID);
-        
-        if (nswindowSuccess) {
-            printf("[Modifier] Successfully modified window %d using NSWindow approach\n", windowID);
-            // Mark as modified in the registry
-            if (window_registry) {
-                registry_mark_window_modified(window_registry, windowID);
-            }
-            return true;
-        }
-        
-        // If NSWindow approach failed, fall back to level setting only
-        printf("[Modifier] NSWindow approach failed for window %d, using level-only approach\n", windowID);
-        tagSuccess = (levelStatus == kCGErrorSuccess);
-    } else {
+    // For normal (non-owner ID 0) windows only
+    {
         // For normal windows, try all connection methods
         
         // First attempt: Try with owner connection if different
@@ -402,7 +387,7 @@ static void addWindowToRetryQueue(CGSWindowID windowID) {
     }
     
     // Add to queue if space available
-    if (retry_window_count < sizeof(retry_windows) / sizeof(retry_windows[0])) {
+    if (retry_window_count < (int)(sizeof(retry_windows) / sizeof(retry_windows[0]))) {
         retry_windows[retry_window_count].windowID = windowID;
         retry_windows[retry_window_count].attempts = 0;
         retry_windows[retry_window_count].next_attempt_time = 
@@ -452,7 +437,7 @@ static void processRetryQueue(void) {
                 } else {
                     // Schedule next retry
                     int delay_index = retry_windows[i].attempts;
-                    if (delay_index >= sizeof(retry_delays) / sizeof(retry_delays[0])) {
+                    if (delay_index >= (int)(sizeof(retry_delays) / sizeof(retry_delays[0]))) {
                         delay_index = sizeof(retry_delays) / sizeof(retry_delays[0]) - 1;
                     }
                     
@@ -487,22 +472,65 @@ bool applyAllWindowModifications(void) {
         return false;
     }
     
-    CGSConnectionID cid = CGSDefaultConnection_ptr();
-    CGSWindowID windows[128];
-    int windowCount = 0;
-    
-    // Get list of all visible windows
-    CGSGetOnScreenWindowList_ptr(cid, cid, 128, windows, &windowCount);
-    
-    printf("[Modifier] Found %d on-screen windows\n", windowCount);
-    
+    // Create local array for safe windows only
+    CGSWindowID safeWindows[128];
+    int safeWindowCount = 0;
     int success_count = 0;
     
-    // Try to modify each window
-    for (int i = 0; i < windowCount; i++) {
-        if (modifyWindowWithCGS(windows[i])) {
-            success_count++;
+    @try {
+        // First phase: Get all windows, but only store the IDs
+        // This avoids passing the full window array to functions that might
+        // crash when accessing certain windows
+        CGSConnectionID cid = CGSDefaultConnection_ptr();
+        CGSWindowID allWindows[128];
+        int windowCount = 0;
+        
+        @try {
+            CGSGetOnScreenWindowList_ptr(cid, cid, 128, allWindows, &windowCount);
+            printf("[Modifier] Found %d on-screen windows\n", windowCount);
+            
+            // Pre-scan phase: Check each window for safety before doing anything else
+            for (int i = 0; i < windowCount; i++) {
+                CGSWindowID windowID = allWindows[i];
+                
+                // Skip windows already marked in registry
+                if (window_registry && registry_is_window_modified(window_registry, windowID)) {
+                    continue;
+                }
+                
+                // Check if this is an unsafe window (owner ID 0)
+                bool unsafe = isOwnerIDZeroWindow(windowID);
+                
+                if (unsafe) {
+                    // Mark as modified in registry to prevent future attempts
+                    if (window_registry) {
+                        registry_mark_window_modified(window_registry, windowID);
+                        printf("[Modifier] Pre-filtered unsafe window %d\n", windowID);
+                    }
+                } else {
+                    // This window seems safe, add to our safe list
+                    if (safeWindowCount < 128) {
+                        safeWindows[safeWindowCount++] = windowID;
+                    }
+                }
+            }
         }
+        @catch (NSException *exception) {
+            printf("[Modifier] Exception during window list retrieval: %s\n", 
+                  [[exception description] UTF8String]);
+            return false;
+        }
+        
+        // Second phase: Only operate on windows we've verified are safe
+        for (int i = 0; i < safeWindowCount; i++) {
+            if (modifyWindowWithCGS(safeWindows[i])) {
+                success_count++;
+            }
+        }
+    }
+    @catch (NSException *exception) {
+        printf("[Modifier] Top-level exception during window modifications: %s\n", 
+              [[exception description] UTF8String]);
     }
     
     printf("[Modifier] Successfully modified %d windows\n", success_count);
@@ -663,7 +691,7 @@ static void updateWindowState(int eventType, CGSWindowID windowID) {
 }
 
 // CGS window notification callback
-static void windowNotificationCallback(int type, void *data, uint32_t data_length, void *arg) {
+static void windowNotificationCallback(int type, void *data, uint32_t data_length, void * __attribute__((unused)) arg) {
     if (!data || data_length < sizeof(uint32_t)) {
         return;
     }
@@ -858,7 +886,7 @@ static void updateInitializationState(int eventType, CGSWindowID windowID) {
             }
             break;
             
-        case APP_INIT_COMPLETE:
+        case APP_INIT_COMPLETE: {
             // No state changes needed, but we'll continue tracking windows
             
             // For diagnostics, count initialized windows periodically
@@ -878,11 +906,12 @@ static void updateInitializationState(int eventType, CGSWindowID windowID) {
                 last_count_time = now;
             }
             break;
+        }
     }
     
     // Clean up closed or invalid windows from our tracking array
     NSMutableIndexSet *indicesToRemove = [NSMutableIndexSet indexSet];
-    [standardWindowIDs enumerateObjectsUsingBlock:^(NSNumber *winIDObj, NSUInteger idx, BOOL *stop) {
+    [standardWindowIDs enumerateObjectsUsingBlock:^(NSNumber *winIDObj, NSUInteger idx, BOOL * __attribute__((unused)) stop) {
         CGSWindowID trackedWinID = [winIDObj unsignedIntValue];
         
         // If we can't get window info, it's likely gone
@@ -1030,7 +1059,7 @@ static bool modifyWindowWithNSWindow(CGSWindowID windowID) {
 }
 
 // Schedule window modification with a small delay to let window finish construction
-static void modifyWindowWhenSafe(CGSWindowID windowID) {
+static void __attribute__((unused)) modifyWindowWhenSafe(CGSWindowID windowID) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
         // Check if the window has already been modified
         if (window_registry && registry_is_window_modified(window_registry, windowID)) {
@@ -1049,7 +1078,7 @@ static void modifyWindowWhenSafe(CGSWindowID windowID) {
 }
 
 // Main entry point for window modifier thread
-void* window_modifier_main(void* arg) {
+void* window_modifier_main(void* __attribute__((unused)) arg) {
     // Set up thread resources
     initThreadResources();
     

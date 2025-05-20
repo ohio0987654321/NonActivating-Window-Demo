@@ -1,6 +1,45 @@
 // window_modifier_cgs.m - Core Graphics Services functions
 #import "window_modifier_cgs.h"
 #import <dlfcn.h>
+#import <pthread.h>
+
+// Global safe window cache to prevent repeated memory access attempts to unsafe windows
+static NSMutableSet *knownUnsafeWindowIDs = nil;
+static pthread_mutex_t unsafeWindowMutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Initialize the safe window caching system
+static void initUnsafeWindowCache(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        knownUnsafeWindowIDs = [[NSMutableSet alloc] init];
+    });
+}
+
+// Check if a window is known to be unsafe
+static bool isKnownUnsafeWindow(CGSWindowID windowID) {
+    if (!knownUnsafeWindowIDs) {
+        initUnsafeWindowCache();
+    }
+    
+    pthread_mutex_lock(&unsafeWindowMutex);
+    bool result = [knownUnsafeWindowIDs containsObject:@(windowID)];
+    pthread_mutex_unlock(&unsafeWindowMutex);
+    
+    return result;
+}
+
+// Mark a window as unsafe
+static void markWindowAsUnsafe(CGSWindowID windowID) {
+    if (!knownUnsafeWindowIDs) {
+        initUnsafeWindowCache();
+    }
+    
+    pthread_mutex_lock(&unsafeWindowMutex);
+    [knownUnsafeWindowIDs addObject:@(windowID)];
+    pthread_mutex_unlock(&unsafeWindowMutex);
+    
+    printf("[CGS] Marked window %d as permanently unsafe\n", windowID);
+}
 
 // CGS Function pointers
 CGSConnectionID (*CGSDefaultConnection_ptr)(void) = NULL;
@@ -66,31 +105,103 @@ bool loadCGSFunctions(void) {
     return success;
 }
 
-// Get window information using CGS
+// Check if a window has owner ID 0 (fundamental boundary we should not cross)
+bool isOwnerIDZeroWindow(CGSWindowID windowID) {
+    // First check our cache of known unsafe windows
+    if (isKnownUnsafeWindow(windowID)) {
+        return true;
+    }
+    
+    if (!CGSGetWindowOwner_ptr || !CGSDefaultConnection_ptr) {
+        // If we can't check ownership, assume it's unsafe
+        return true;
+    }
+    
+    @try {
+        CGSConnectionID cid = CGSDefaultConnection_ptr();
+        CGSConnectionID ownerCID = CGSGetWindowOwner_ptr(cid, windowID);
+        
+        // Windows with owner ID 0 are unsafe
+        if (ownerCID == 0) {
+            // Add to cache for future quick checks
+            markWindowAsUnsafe(windowID);
+            printf("[CGS] Detected owner ID 0 for window %d\n", windowID);
+            return true;
+        }
+        
+        return false;
+    }
+    @catch (NSException *exception) {
+        // If we got an exception checking ownership, assume it's unsafe
+        printf("[CGS] Exception checking window ownership: %s\n", 
+              [[exception description] UTF8String]);
+        markWindowAsUnsafe(windowID);
+        return true;
+    }
+}
+
+// Get window information using CGS with enhanced safety checks
 NSDictionary *getWindowInfoWithCGS(CGSWindowID windowID) {
     if (!CGSCopyWindowDescriptionList_ptr || !CGSDefaultConnection_ptr) {
         return nil;
     }
     
-    CGSConnectionID cid = CGSDefaultConnection_ptr();
-    CFArrayRef windowDescriptions = CGSCopyWindowDescriptionList_ptr(cid, windowID);
-    
-    if (!windowDescriptions || CFArrayGetCount(windowDescriptions) < 1) {
-        if (windowDescriptions) {
-            CFRelease(windowDescriptions);
-        }
+    // First check if this is a known unsafe window
+    if (isKnownUnsafeWindow(windowID)) {
         return nil;
     }
     
-    NSDictionary *windowInfo = (NSDictionary *)CFArrayGetValueAtIndex(windowDescriptions, 0);
-    CFRetain((__bridge CFTypeRef)windowInfo);
-    CFRelease(windowDescriptions);
+    // Then check if it has owner ID 0
+    if (isOwnerIDZeroWindow(windowID)) {
+        return nil;
+    }
     
-    return CFBridgingRelease((__bridge_retained CFTypeRef)windowInfo);
+    // Extra safety: try-catch all CGS operations
+    @try {
+        CGSConnectionID cid = CGSDefaultConnection_ptr();
+        CFArrayRef windowDescriptions = NULL;
+        
+        @try {
+            windowDescriptions = CGSCopyWindowDescriptionList_ptr(cid, windowID);
+            
+            if (!windowDescriptions || CFArrayGetCount(windowDescriptions) < 1) {
+                if (windowDescriptions) {
+                    CFRelease(windowDescriptions);
+                }
+                return nil;
+            }
+            
+            NSDictionary *windowInfo = (NSDictionary *)CFArrayGetValueAtIndex(windowDescriptions, 0);
+            CFRetain((__bridge CFTypeRef)windowInfo);
+            CFRelease(windowDescriptions);
+            
+            return CFBridgingRelease((__bridge_retained CFTypeRef)windowInfo);
+        }
+        @catch (NSException *exception) {
+            printf("[CGS] Exception while getting window info: %s\n", 
+                  [[exception description] UTF8String]);
+            
+            // Mark this window as unsafe for future checks
+            markWindowAsUnsafe(windowID);
+            
+            if (windowDescriptions) {
+                CFRelease(windowDescriptions);
+            }
+            return nil;
+        }
+    }
+    @catch (NSException *exception) {
+        printf("[CGS] Outer exception in getWindowInfoWithCGS: %s\n",
+              [[exception description] UTF8String]);
+        
+        // Mark this window as unsafe for future checks
+        markWindowAsUnsafe(windowID);
+        return nil;
+    }
 }
 
 // Determine window class from CGS properties
-window_class_t determineWindowClass(CGSWindowID windowID, NSDictionary *windowInfo) {
+window_class_t determineWindowClass(CGSWindowID __attribute__((unused)) windowID, NSDictionary *windowInfo) {
     if (!windowInfo) {
         return WINDOW_CLASS_UNKNOWN;
     }
@@ -196,12 +307,21 @@ bool isUtilityWindow(CGSWindowID windowID) {
             
             // Use the window classification to determine if it's a utility window
             switch (state->window_class) {
+                // Windows that are considered utility/helper windows
                 case WINDOW_CLASS_PANEL:
                 case WINDOW_CLASS_SHEET:
                 case WINDOW_CLASS_SYSTEM:
                 case WINDOW_CLASS_HELPER:
+                case WINDOW_CLASS_POPUP:
+                case WINDOW_CLASS_MENU:
+                case WINDOW_CLASS_TOOLBAR:
+                case WINDOW_CLASS_SPLASH:
                     return true;
                     
+                // Windows that are considered standard/main application windows
+                case WINDOW_CLASS_NORMAL:
+                case WINDOW_CLASS_UTILITY:
+                case WINDOW_CLASS_DIALOG:
                 case WINDOW_CLASS_STANDARD:
                     return false;
                     

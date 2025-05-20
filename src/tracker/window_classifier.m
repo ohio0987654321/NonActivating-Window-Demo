@@ -139,7 +139,7 @@ static void updateWindowInitState(CGSWindowID windowID, int eventType) {
 }
 
 // Classify window based on CGS properties
-static window_class_t classifyWindowWithInfo(CGSWindowID windowID, NSDictionary *windowInfo) {
+static window_class_t classifyWindowWithInfo(CGSWindowID __attribute__((unused)) windowID, NSDictionary *windowInfo) {
     if (!windowInfo) {
         return WINDOW_CLASS_UNKNOWN;
     }
@@ -149,19 +149,21 @@ static window_class_t classifyWindowWithInfo(CGSWindowID windowID, NSDictionary 
     int windowLevel = level ? [level intValue] : 0;
     
     // Get window tags
-    NSNumber *tagsNum = windowInfo[@"kCGSWindowTags"];
-    uint32_t tags = tagsNum ? [tagsNum unsignedIntValue] : 0;
+    NSNumber * __attribute__((unused)) tagsNum = windowInfo[@"kCGSWindowTags"];
+    // Tags could be used for additional classification if needed in the future
+    // Currently unused but preserved for future expansion
     
     // Get window alpha
     NSNumber *alpha = windowInfo[@"kCGSWindowAlpha"];
     float windowAlpha = alpha ? [alpha floatValue] : 1.0;
     
     // Get sharing state
-    NSNumber *sharingState = windowInfo[@"kCGSWindowSharingState"];
-    int sharing = sharingState ? [sharingState intValue] : 0;
+    NSNumber * __attribute__((unused)) sharingState = windowInfo[@"kCGSWindowSharingState"];
+    // Sharing state could be used for privacy features in the future
+    // Currently unused but preserved for future expansion
     
-    // Get window type
-    NSString *windowType = windowInfo[@"kCGSWindowTitle"];
+    // Get window title - could be used for more specific classification
+    // Currently unused but preserved for future expansion
     
     // Check for utility window (helper, panel, etc.)
     if (windowLevel >= 19 && windowLevel <= 23) {

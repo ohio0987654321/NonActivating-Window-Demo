@@ -17,6 +17,9 @@ extern CGSConnectionID (*CGSGetWindowOwner_ptr)(CGSConnectionID cid, CGSWindowID
 // Load CGS functions
 bool loadCGSFunctions(void);
 
+// Window safety check functions
+bool isOwnerIDZeroWindow(CGSWindowID windowID);
+
 // Window info functions
 NSDictionary* getWindowInfoWithCGS(CGSWindowID windowID);
 window_class_t determineWindowClass(CGSWindowID windowID, NSDictionary *windowInfo);
