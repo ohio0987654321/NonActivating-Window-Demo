@@ -2,33 +2,16 @@
 CC=clang
 # Architecture flags for universal binary (x86_64, arm64, arm64e)
 ARCH_FLAGS=-arch x86_64 -arch arm64 -arch arm64e
-CFLAGS=-Wall -Wextra -g -fPIC -ObjC -fobjc-arc $(ARCH_FLAGS)
+# Added optimization flag -O2 while keeping debug info
+CFLAGS=-Wall -Wextra -g -O2 -fPIC -ObjC -fobjc-arc $(ARCH_FLAGS)
 LDFLAGS=-dynamiclib -framework Cocoa -framework AppKit -framework CoreFoundation $(ARCH_FLAGS)
+
+# Enable parallel builds
+MAKEFLAGS += -j$(shell sysctl -n hw.ncpu)
 
 # Directories
 SRC_DIR=src
 BUILD_DIR=build
-CORE_DIR=$(SRC_DIR)/core
-CGS_DIR=$(SRC_DIR)/cgs
-TRACKER_DIR=$(SRC_DIR)/tracker
-OPS_DIR=$(SRC_DIR)/operations
-
-# Source files
-CORE_SRCS=$(wildcard $(CORE_DIR)/*.c)
-CGS_SRCS=$(wildcard $(CGS_DIR)/*.m)
-TRACKER_SRCS=$(wildcard $(TRACKER_DIR)/*.c) $(wildcard $(TRACKER_DIR)/*.m)
-OPS_SRCS=$(wildcard $(OPS_DIR)/*.m) $(wildcard $(OPS_DIR)/*.c)
-
-# Split tracker sources into C and M files
-TRACKER_C_SRCS=$(wildcard $(TRACKER_DIR)/*.c)
-TRACKER_M_SRCS=$(wildcard $(TRACKER_DIR)/*.m)
-
-# Object files
-OBJS=$(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(CORE_SRCS)) \
-     $(patsubst $(SRC_DIR)/%.m,$(BUILD_DIR)/%.o,$(CGS_SRCS)) \
-     $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(TRACKER_C_SRCS)) \
-     $(patsubst $(SRC_DIR)/%.m,$(BUILD_DIR)/%.o,$(TRACKER_M_SRCS)) \
-     $(patsubst $(SRC_DIR)/%.m,$(BUILD_DIR)/%.o,$(OPS_SRCS))
 
 # Create build directories
 BUILD_DIRS=$(BUILD_DIR) \
@@ -36,6 +19,32 @@ BUILD_DIRS=$(BUILD_DIR) \
           $(BUILD_DIR)/cgs \
           $(BUILD_DIR)/tracker \
           $(BUILD_DIR)/operations
+
+# Individual source files
+INJECTION_ENTRY_SRC=$(SRC_DIR)/core/injection_entry.c
+WINDOW_MODIFIER_CGS_SRC=$(SRC_DIR)/cgs/window_modifier_cgs.m
+WINDOW_REGISTRY_SRC=$(SRC_DIR)/tracker/window_registry.c
+WINDOW_CLASSIFIER_SRC=$(SRC_DIR)/tracker/window_classifier.m
+WINDOW_MODIFIER_SWIZZLE_SRC=$(SRC_DIR)/operations/window_modifier_swizzle.m
+WINDOW_MODIFIER_SRC=$(SRC_DIR)/operations/window_modifier.m
+INJECTOR_SRC=$(SRC_DIR)/injector.c
+
+# Individual object files
+INJECTION_ENTRY_OBJ=$(BUILD_DIR)/core/injection_entry.o
+WINDOW_MODIFIER_CGS_OBJ=$(BUILD_DIR)/cgs/window_modifier_cgs.o
+WINDOW_REGISTRY_OBJ=$(BUILD_DIR)/tracker/window_registry.o
+WINDOW_CLASSIFIER_OBJ=$(BUILD_DIR)/tracker/window_classifier.o
+WINDOW_MODIFIER_SWIZZLE_OBJ=$(BUILD_DIR)/operations/window_modifier_swizzle.o
+WINDOW_MODIFIER_OBJ=$(BUILD_DIR)/operations/window_modifier.o
+
+# All object files
+OBJS= \
+    $(INJECTION_ENTRY_OBJ) \
+    $(WINDOW_MODIFIER_CGS_OBJ) \
+    $(WINDOW_REGISTRY_OBJ) \
+    $(WINDOW_CLASSIFIER_OBJ) \
+    $(WINDOW_MODIFIER_SWIZZLE_OBJ) \
+    $(WINDOW_MODIFIER_OBJ)
 
 # Target libraries and executables
 DYLIB=$(BUILD_DIR)/libwindowmodifier.dylib
@@ -48,26 +57,36 @@ all: $(BUILD_DIRS) $(DYLIB) $(INJECTOR)
 $(BUILD_DIRS):
 	@mkdir -p $@
 
-# Build the DYLIB (ensure we only use object files)
+# Individual compilation rules
+$(INJECTION_ENTRY_OBJ): $(INJECTION_ENTRY_SRC) | $(BUILD_DIRS)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(WINDOW_MODIFIER_CGS_OBJ): $(WINDOW_MODIFIER_CGS_SRC) | $(BUILD_DIRS)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(WINDOW_REGISTRY_OBJ): $(WINDOW_REGISTRY_SRC) | $(BUILD_DIRS)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(WINDOW_CLASSIFIER_OBJ): $(WINDOW_CLASSIFIER_SRC) | $(BUILD_DIRS)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(WINDOW_MODIFIER_SWIZZLE_OBJ): $(WINDOW_MODIFIER_SWIZZLE_SRC) | $(BUILD_DIRS)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(WINDOW_MODIFIER_OBJ): $(WINDOW_MODIFIER_SRC) | $(BUILD_DIRS)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Build the DYLIB
 $(DYLIB): $(OBJS)
 	@echo "Linking $(DYLIB) with object files only"
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(OBJS)
 
 # Build the injector
-$(INJECTOR): $(SRC_DIR)/injector.c
+$(INJECTOR): $(INJECTOR_SRC) | $(BUILD_DIRS)
 	$(CC) $(CFLAGS) -o $@ $< -framework CoreFoundation
-
-# Compile C files
-$(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(BUILD_DIRS)
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-# Compile Objective-C files
-$(BUILD_DIR)/%.o: $(SRC_DIR)/%.m | $(BUILD_DIRS)
-	$(CC) $(CFLAGS) -c -o $@ $<
 
 # Clean build files
 clean:
 	rm -rf $(BUILD_DIR)
-
 
 .PHONY: all clean
